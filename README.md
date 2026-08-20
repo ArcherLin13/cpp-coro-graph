@@ -125,12 +125,23 @@ First match wins. Put longer / more specific strings first.
 
 ## Edge kinds
 
-| kind | meaning |
-|------|---------|
-| `await` | `co_await Target` in a coroutine body |
-| `device_call` | body text hit a device API pattern |
+Different questions → different edge types. Filter with `--edge-kind` / viz dropdown.
 
-Node colors in HTML = domain. Red edges = await.
+| kind | layer | meaning | example |
+|------|-------|---------|---------|
+| `await` | control | coroutine suspends on target | `Caller --await--> A` |
+| **`seq`** | **order** | **same body, consecutive `co_await` order** | `A --seq--> DoCpuWork` (inside `Caller`) |
+| `calls` | control | normal / sync call | `Foo --calls--> Bar` |
+| `spawns` | schedule | starts work on another thread/task | `std::thread`, `co_spawn` |
+| `handoff` | schedule | posts/schedules to executor | `PostTask`, `asio::post` |
+| `device_call` | device | hit a device API pattern | `clEnqueue…` |
+| **`contains`** | **structure** | **file owns this function** | `file:demo.cpp --contains--> Caller` |
+
+- Want **顺序**：`--edge-kind seq`（或 `seq,await`）
+- Want **文件归属**：`--edge-kind contains`
+- Want **谁等谁**：`--edge-kind await`
+
+`seq` metadata `raw` records which coroutine (`in Caller #0`).
 
 ## Skipped directories
 

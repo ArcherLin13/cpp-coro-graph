@@ -99,7 +99,14 @@ def explore(
     if not primary:
         return {"query": keyword, "match": None, "matches": [], "nodes": [], "edges": []}
 
-    edge_kinds = edge_kinds or ["calls", "await", "handoff", "spawns", "device_call"]
+    edge_kinds = edge_kinds or [
+        "calls",
+        "await",
+        "seq",
+        "handoff",
+        "spawns",
+        "device_call",
+    ]
     seen = {primary["id"]}
     frontier = {primary["id"]}
     nodes = {primary["id"]: primary}

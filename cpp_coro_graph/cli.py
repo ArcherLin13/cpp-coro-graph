@@ -363,7 +363,7 @@ def _add_query_common(p: argparse.ArgumentParser) -> None:
         "--edge-kind",
         type=str,
         default="all",
-        help="Filter edges: all | calls,await,handoff,spawns,device_call",
+        help="Filter edges: all | calls,await,seq,handoff,spawns,device_call,contains",
     )
 
 

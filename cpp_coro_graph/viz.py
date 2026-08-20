@@ -17,10 +17,12 @@ DOMAIN_COLOR = {
 
 EDGE_COLOR = {
     "await": "#ef4444",
+    "seq": "#f97316",
     "calls": "#38bdf8",
     "device_call": "#f59e0b",
     "handoff": "#a855f7",
     "spawns": "#ec4899",
+    "contains": "#64748b",
 }
 
 
@@ -83,19 +85,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </select>
   <select id="ekind">
     <option value="">all edges</option>
-    <option value="calls">calls</option>
+    <option value="seq">seq (await order)</option>
     <option value="await">await</option>
+    <option value="calls">calls</option>
     <option value="handoff">handoff</option>
     <option value="spawns">spawns</option>
     <option value="device_call">device_call</option>
+    <option value="contains">contains (file)</option>
   </select>
   <label class="chip"><input type="checkbox" id="hideUnresolved"/> hide unresolved</label>
   <label class="chip"><input type="checkbox" id="onlyLinked" checked/> only linked nodes</label>
   <span class="chip"><span class="dot" style="background:#3b82f6"></span>cpu</span>
   <span class="chip"><span class="dot" style="background:#22c55e"></span>gpu</span>
   <span class="chip"><span class="dot" style="background:#f59e0b"></span>npu</span>
-  <span class="chip"><span class="dot" style="background:#38bdf8"></span>calls</span>
+  <span class="chip"><span class="dot" style="background:#f97316"></span>seq</span>
   <span class="chip"><span class="dot" style="background:#ef4444"></span>await</span>
+  <span class="chip"><span class="dot" style="background:#38bdf8"></span>calls</span>
+  <span class="chip"><span class="dot" style="background:#64748b"></span>contains</span>
   <span class="chip"><span class="dot" style="background:#a855f7"></span>handoff</span>
   <span class="chip"><span class="dot" style="background:#ec4899"></span>spawns</span>
   <span id="meta"></span>

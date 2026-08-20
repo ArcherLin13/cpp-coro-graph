@@ -108,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1.4-decls-class")
-    store.upsert_meta(conn, "version", "0.3.2")
+    store.upsert_meta(conn, "mode", "syntax-v1.5-seq-contains")
+    store.upsert_meta(conn, "version", "0.3.3")
 
     extracts: list[FileExtract] = []
     total = len(files)
@@ -199,13 +199,24 @@ def index_repo(
         for e in ex.edges:
             src = local_to_id.get((ex.path, e.source_qname))
             if not src:
+                # seq edges: source is previous await *target* (resolve by name)
+                src = index.resolve(
+                    e.source_qname,
+                    from_file=e.file_path,
+                    from_namespace=e.source_namespace,
+                    usings=ex.usings,
+                )
+            if not src:
                 continue
-            tgt = index.resolve(
-                e.target_name,
-                from_file=e.file_path,
-                from_namespace=e.source_namespace,
-                usings=ex.usings,
-            )
+
+            tgt = local_to_id.get((ex.path, e.target_name))
+            if tgt is None:
+                tgt = index.resolve(
+                    e.target_name,
+                    from_file=e.file_path,
+                    from_namespace=e.source_namespace,
+                    usings=ex.usings,
+                )
             if tgt is not None:
                 # count as cross-file if target file differs
                 row = conn.execute(
@@ -246,7 +257,8 @@ def index_repo(
                         ),
                     )
 
-            key = (src, tgt, e.kind)
+            # seq may repeat A→B under different owners — keep distinct via raw
+            key = (src, tgt, e.kind, e.raw_target or "")
             if key in seen_edge_keys:
                 continue
             seen_edge_keys.add(key)

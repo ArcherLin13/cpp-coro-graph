@@ -818,6 +818,8 @@ def extract_file(
     for n in out.nodes:
         ns_of.setdefault(n.qualified_name, n.namespace)
 
+    # Collect awaits in source order, then emit await + seq edges.
+    awaits: list[tuple[int, str, str, str, str]] = []  # idx, target, owner, domain, backend
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
         for m in rx.finditer(clean):
             idx = m.start()
@@ -842,6 +844,7 @@ def extract_file(
             hit = match_device(target, rules)
             if hit:
                 domain, backend = hit
+            awaits.append((idx, target, owner, domain, backend))
             out.edges.append(
                 RawEdge(
                     source_qname=owner,
@@ -853,6 +856,59 @@ def extract_file(
                     backend=backend,
                     raw_target=m.group(0)[:120],
                     source_namespace=ns_of.get(owner, ''),
+                )
+            )
+
+    # Sequential order: co_await A(); co_await B() => A -seq-> B (same owner)
+    awaits.sort(key=lambda t: t[0])
+    by_owner: dict[str, list[tuple[int, str, str, str]]] = {}
+    for idx, target, owner, domain, backend in awaits:
+        by_owner.setdefault(owner, []).append((idx, target, domain, backend))
+    for owner, items in by_owner.items():
+        for i in range(len(items) - 1):
+            _, prev_t, _, _ = items[i]
+            idx2, next_t, dom, back = items[i + 1]
+            if prev_t == next_t:
+                continue
+            out.edges.append(
+                RawEdge(
+                    source_qname=prev_t,  # resolved by indexer (not local owner)
+                    target_name=next_t,
+                    kind='seq',
+                    file_path=rel,
+                    line=line_of(clean, idx2),
+                    domain=dom,
+                    backend=back,
+                    raw_target=f'in {owner} #{i}',
+                    source_namespace=ns_of.get(owner, ''),
+                )
+            )
+
+    # Structural: file contains each defined function/coroutine
+    if bodies:
+        file_node = f'file:{rel}'
+        if file_node not in seen_qnames:
+            seen_qnames.add(file_node)
+            out.nodes.append(
+                RawNode(
+                    name=Path(rel).name,
+                    qualified_name=file_node,
+                    kind='file',
+                    file_path=rel,
+                    start_line=1,
+                    end_line=1,
+                )
+            )
+        for qn, lo, _hi, ns in bodies:
+            out.edges.append(
+                RawEdge(
+                    source_qname=file_node,
+                    target_name=qn,  # local exact qname — indexer maps locally first
+                    kind='contains',
+                    file_path=rel,
+                    line=line_of(clean, lo),
+                    raw_target=f'file contains {qn}',
+                    source_namespace=ns,
                 )
             )
 
