@@ -1,0 +1,13 @@
+{
+  "comment": "Return-type name fragments that hint a coroutine API. Extend for your codebase.",
+  "return_type_names": [
+    "task",
+    "Task",
+    "Lazy",
+    "Future",
+    "Awaitable",
+    "AsyncTask",
+    "Coro",
+    "coroutine"
+  ]
+}

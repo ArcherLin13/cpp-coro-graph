@@ -8,7 +8,13 @@ import sys
 import time
 from pathlib import Path
 
-from .extract import CPP_EXTS, FileExtract, load_device_rules, extract_file
+from .extract import (
+    CPP_EXTS,
+    FileExtract,
+    load_coro_types,
+    load_device_rules,
+    extract_file,
+)
 from . import store
 
 SKIP_DIRS = {
@@ -83,7 +89,8 @@ def index_repo(
     log(f"index start root={root}")
     log(f"db={db_path}")
     rules = load_device_rules(rules_path)
-    log(f"loaded {len(rules)} device rules")
+    coro_types = load_coro_types()
+    log(f"loaded {len(rules)} device rules, {len(coro_types)} coro type names")
     files = iter_cpp_files(root)
     if max_files > 0:
         files = files[:max_files]
@@ -112,7 +119,7 @@ def index_repo(
         log(f"  parse start [{i}/{total}] {rel} ({sz} bytes)")
         t1 = time.time()
         try:
-            ex = extract_file(fp, rel, rules)
+            ex = extract_file(fp, rel, rules, coro_types=coro_types)
         except Exception as exc:  # noqa: BLE001
             log(f"  SKIP {rel}: {exc}")
             skipped += 1
@@ -141,7 +148,6 @@ def index_repo(
         for n in ex.nodes:
             nid = store.node_id(n.qualified_name, n.file_path, n.start_line)
             by_qname[n.qualified_name] = nid
-            by_qname[n.name] = nid
             by_name.setdefault(n.name, []).append(nid)
             conn.execute(
                 "INSERT OR REPLACE INTO nodes"
@@ -161,11 +167,15 @@ def index_repo(
                 ),
             )
             node_count += 1
+    for name, ids in by_name.items():
+        if len(ids) == 1 and name not in by_qname:
+            by_qname[name] = ids[0]
     log(f"nodes inserted: {node_count}")
 
     log("building edges ...")
     stub_ids: set[str] = set()
     edge_count = 0
+    seen_edge_keys: set[tuple[str, str, str]] = set()
     for ex in extracts:
         for e in ex.edges:
             src = by_qname.get(e.source_qname)
@@ -176,8 +186,6 @@ def index_repo(
             tgt = None
             if t in by_qname:
                 tgt = by_qname[t]
-            elif simple in by_qname and len(by_name.get(simple, [])) == 1:
-                tgt = by_qname[simple]
             elif simple in by_name and len(by_name[simple]) == 1:
                 tgt = by_name[simple][0]
             elif simple in by_name and len(by_name[simple]) > 1:
@@ -186,8 +194,8 @@ def index_repo(
                     for i in by_name[simple]
                     if i.startswith(e.file_path + "::")
                 ]
-                tgt = same[0] if same else by_name[simple][0]
-            else:
+                tgt = same[0] if same else None
+            if tgt is None:
                 stub_q = t
                 stub_id = f"unresolved::{stub_q}"
                 tgt = stub_id
@@ -217,6 +225,11 @@ def index_repo(
                         ),
                     )
                     by_qname[stub_q] = stub_id
+
+            key = (src, tgt, e.kind)
+            if key in seen_edge_keys:
+                continue
+            seen_edge_keys.add(key)
 
             conn.execute(
                 "INSERT INTO edges"

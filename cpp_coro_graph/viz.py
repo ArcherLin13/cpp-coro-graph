@@ -17,8 +17,8 @@ DOMAIN_COLOR = {
 
 EDGE_COLOR = {
     "await": "#ef4444",
+    "calls": "#38bdf8",
     "device_call": "#f59e0b",
-    "calls": "#64748b",
 }
 
 
@@ -81,31 +81,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </select>
   <select id="ekind">
     <option value="">all edges</option>
-    <option>await</option><option>device_call</option>
+    <option value="calls">calls</option>
+    <option value="await">await</option>
+    <option value="device_call">device_call</option>
   </select>
-  <label class="chip"><input type="checkbox" id="hideUnresolved" checked/> hide unresolved</label>
+  <label class="chip"><input type="checkbox" id="hideUnresolved"/> hide unresolved</label>
+  <label class="chip"><input type="checkbox" id="onlyLinked" checked/> only linked nodes</label>
   <span class="chip"><span class="dot" style="background:#3b82f6"></span>cpu</span>
   <span class="chip"><span class="dot" style="background:#22c55e"></span>gpu</span>
   <span class="chip"><span class="dot" style="background:#f59e0b"></span>npu</span>
-  <span class="chip"><span class="dot" style="background:#ef4444"></span>await edge</span>
+  <span class="chip"><span class="dot" style="background:#38bdf8"></span>calls</span>
+  <span class="chip"><span class="dot" style="background:#ef4444"></span>await</span>
   <span id="meta"></span>
 </div>
 <div id="net"></div>
 <script>
 const DATA = __DATA__;
 const meta = document.getElementById('meta');
-meta.textContent = `nodes ${DATA.stats.nodes} · edges ${DATA.stats.edges} · files ${DATA.stats.files}`;
+meta.textContent = `files ${DATA.stats.files} · nodes ${DATA.stats.nodes} · edges ${DATA.stats.edges} · kinds ${JSON.stringify(DATA.stats.edge_kinds||{})}`;
+
+function linkedIds(ekind) {
+  const ids = new Set();
+  for (const e of DATA.edges) {
+    if (ekind && e.kind !== ekind) continue;
+    ids.add(e.from); ids.add(e.to);
+  }
+  return ids;
+}
 
 function visibleNodes() {
   const q = document.getElementById('q').value.trim().toLowerCase();
   const domain = document.getElementById('domain').value;
   const hideU = document.getElementById('hideUnresolved').checked;
+  const onlyLinked = document.getElementById('onlyLinked').checked;
+  const ekind = document.getElementById('ekind').value;
+  const linked = onlyLinked ? linkedIds(ekind) : null;
   return DATA.nodes.filter(n => {
-    if (hideU && (n.kind === 'unresolved' || n.kind === 'device_api' && n.id.startsWith('unresolved:'))) {
-      // keep device_api stubs if they have domain, but hide plain unresolved
-      if (n.kind === 'unresolved') return false;
-    }
-    if (hideU && n.id.startsWith('unresolved:') && n.kind === 'unresolved') return false;
+    if (hideU && (n.kind === 'unresolved' || String(n.id).startsWith('unresolved:'))) return false;
+    if (linked && !linked.has(n.id)) return false;
     if (domain && n.domain !== domain) return false;
     if (q && !(`${n.label} ${n.file}`.toLowerCase().includes(q))) return false;
     return true;
@@ -119,7 +132,7 @@ function render() {
   const edges = DATA.edges.filter(e => ids.has(e.from) && ids.has(e.to) && (!ekind || e.kind === ekind));
   const nset = new vis.DataSet(nodes.map(n => ({
     id: n.id,
-    label: n.label.length > 40 ? n.label.slice(0,37)+'…' : n.label,
+    label: n.label.length > 40 ? n.label.slice(0,37)+'...' : n.label,
     color: { background: n.color, border: '#0f172a', highlight: { background: n.color, border: '#fff' } },
     font: { color: '#f8fafc', size: 12 },
     title: `${n.label}\\n${n.kind} · ${n.domain}/${n.backend||'-'}\\n${n.file}:${n.line}`
@@ -138,7 +151,7 @@ function render() {
   });
   window.__net = network;
 }
-['q','domain','ekind','hideUnresolved'].forEach(id => document.getElementById(id).addEventListener('input', render));
+['q','domain','ekind','hideUnresolved','onlyLinked'].forEach(id => document.getElementById(id).addEventListener('input', render));
 render();
 </script>
 </body>

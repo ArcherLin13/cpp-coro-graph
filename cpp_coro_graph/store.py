@@ -106,11 +106,18 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "SELECT kind, COUNT(*) AS c FROM edges GROUP BY kind"
         )
     }
+    node_kinds = {
+        r["kind"]: r["c"]
+        for r in conn.execute(
+            "SELECT kind, COUNT(*) AS c FROM nodes GROUP BY kind"
+        )
+    }
     return {
         "files": count("files"),
         "nodes": count("nodes"),
         "edges": count("edges"),
         "node_domains": domains,
+        "node_kinds": node_kinds,
         "edge_kinds": kinds,
         "generated_at": int(time.time()),
     }
