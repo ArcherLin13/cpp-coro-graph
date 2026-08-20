@@ -19,7 +19,7 @@ def _default_db(root: Path) -> Path:
 
 def cmd_index(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
-    log(f"command=index path={args.path} → {root}")
+    log(f"command=index path={args.path} -> {root}")
     if not root.is_dir():
         log(f"ERROR: not a directory: {root}")
         return 2

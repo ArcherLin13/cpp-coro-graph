@@ -55,13 +55,13 @@ def should_skip_dir(name: str) -> bool:
 def iter_cpp_files(root: Path) -> list[Path]:
     files: list[Path] = []
     scanned_dirs = 0
-    log(f"scanning under {root} …")
+    log(f"scanning under {root} ...")
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
         scanned_dirs += 1
         if scanned_dirs == 1 or scanned_dirs % 200 == 0:
             log(
-                f"  walking… dirs={scanned_dirs} cpp_files={len(files)} "
+                f"  walking... dirs={scanned_dirs} cpp_files={len(files)} "
                 f"current={dirpath}"
             )
         for name in filenames:
@@ -90,7 +90,7 @@ def index_repo(
         log(f"--max-files={max_files}, using {len(files)} files")
 
     if not files:
-        log("WARNING: no .cpp/.h/.cc/… files found (check path / skip rules)")
+        log("WARNING: no .cpp/.h/.cc/... files found (check path / skip rules)")
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = store.connect(db_path)
@@ -101,7 +101,7 @@ def index_repo(
 
     extracts: list[FileExtract] = []
     total = len(files)
-    log(f"parsing {total} files …")
+    log(f"parsing {total} files ...")
     for i, fp in enumerate(files, 1):
         rel = str(fp.relative_to(root)).replace("\\", "/")
         if i == 1 or i % 50 == 0 or i == total:
@@ -117,7 +117,7 @@ def index_repo(
             (rel, fp.stat().st_size, int(time.time())),
         )
 
-    log("building nodes …")
+    log("building nodes ...")
     by_qname: dict[str, str] = {}
     by_name: dict[str, list[str]] = {}
     node_count = 0
@@ -147,7 +147,7 @@ def index_repo(
             node_count += 1
     log(f"nodes inserted: {node_count}")
 
-    log("building edges …")
+    log("building edges ...")
     stub_ids: set[str] = set()
     edge_count = 0
     for ex in extracts:
@@ -220,7 +220,7 @@ def index_repo(
             edge_count += 1
     log(f"edges inserted: {edge_count} (unresolved stubs: {len(stub_ids)})")
 
-    log("promoting device domains …")
+    log("promoting device domains ...")
     for row in conn.execute(
         "SELECT source, domain FROM edges WHERE kind='device_call' AND domain!='unknown'"
     ).fetchall():
@@ -235,5 +235,5 @@ def index_repo(
     s["root"] = str(root)
     s["db"] = str(db_path)
     conn.close()
-    log(f"index done in {time.time() - t0:.1f}s → {db_path}")
+    log(f"index done in {time.time() - t0:.1f}s -> {db_path}")
     return s
