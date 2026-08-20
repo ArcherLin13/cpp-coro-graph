@@ -108,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1.3-crossfile-ns-thread")
-    store.upsert_meta(conn, "version", "0.3.0")
+    store.upsert_meta(conn, "mode", "syntax-v1.4-decls-class")
+    store.upsert_meta(conn, "version", "0.3.2")
 
     extracts: list[FileExtract] = []
     total = len(files)
@@ -164,6 +164,7 @@ def index_repo(
                     qualified_name=n.qualified_name,
                     file_path=n.file_path,
                     namespace=n.namespace,
+                    kind=n.kind,
                 )
             )
             conn.execute(

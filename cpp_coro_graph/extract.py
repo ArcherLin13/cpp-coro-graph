@@ -1,9 +1,9 @@
-"""Syntax-level C++ extraction: function defs, calls, co_await, device tags.
+"""Syntax-level C++ extraction: function defs/decls, calls, co_await, device tags.
 
-V1.2 goals:
-- Detect normal call chains (Foo / Class::Bar / a->b), not only co_await
-- Detect coroutine bodies via co_await/co_return/co_yield
-- Stay linear-time; avoid catastrophic regexes on big headers
+Goals:
+- Every function definition AND declaration is a node (headers included)
+- Class/struct scope qualifies members (Foo::bar)
+- Detect call chains + co_await; stay linear-time
 """
 
 from __future__ import annotations
@@ -288,6 +288,11 @@ def _read_ident_back(text: str, i: int) -> tuple[str, int]:
             chars.append(c)
             i -= 1
             continue
+        # destructor: ~Name or Qual::~Name
+        if c == "~" and chars:
+            chars.append(c)
+            i -= 1
+            continue
         if c == ":" and i > 0 and text[i - 1] == ":":
             chars.append("::")
             i -= 2
@@ -296,11 +301,50 @@ def _read_ident_back(text: str, i: int) -> tuple[str, int]:
     return "".join(reversed(chars)), i
 
 
+def _read_func_name_before_paren(text: str, paren_close: int) -> tuple[str, int] | None:
+    """Given `)` of param list, return (qname, name_start) including destructors."""
+    d = 0
+    p = paren_close
+    while p >= 0:
+        if text[p] == ")":
+            d += 1
+        elif text[p] == "(":
+            d -= 1
+            if d == 0:
+                break
+        p -= 1
+    if p < 0:
+        return None
+    k = _skip_ws_back(text, p - 1)
+    qname, name_start = _read_ident_back(text, k)
+    if not qname:
+        return None
+    # Unqualified destructor: ~Name (tilde not consumed if chars was empty edge-case)
+    pre = _skip_ws_back(text, name_start - 1)
+    if pre >= 0 and text[pre] == "~" and not qname.startswith("~"):
+        qname = "~" + qname
+        name_start = pre
+    if _looks_like_control_or_type(text, name_start, qname):
+        return None
+    return qname, name_start
+
+
+_TRAILING_KW = ("override", "final", "const", "volatile", "mutable", "noexcept")
+
+
 def _looks_like_control_or_type(text: str, name_start: int, qname: str) -> bool:
-    name = qname.split("::")[-1]
-    if name in _CALL_KEYWORDS or name in {"else", "try", "do", "namespace", "class", "struct", "enum", "union"}:
+    name = qname.split("::")[-1].lstrip("~")
+    if name in _CALL_KEYWORDS or name in {
+        "else",
+        "try",
+        "do",
+        "namespace",
+        "class",
+        "struct",
+        "enum",
+        "union",
+    }:
         return True
-    # enum/class/struct X { — name_start preceded by those keywords
     k = _skip_ws_back(text, name_start - 1)
     prev, _ = _read_ident_back(text, k)
     if prev in {"class", "struct", "enum", "union", "namespace", "concept"}:
@@ -308,23 +352,38 @@ def _looks_like_control_or_type(text: str, name_start: int, qname: str) -> bool:
     return False
 
 
-def parse_function_at_brace(text: str, brace_open: int) -> tuple[str, int, int, int] | None:
-    """If `{` at brace_open starts a function body, return (qname, name_start, body_lo, body_hi)."""
-    body_hi = find_matching_brace(text, brace_open)
-    if body_hi < 0:
-        return None
+def _skip_attr_back(text: str, j: int) -> int:
+    """Skip [[...]] attributes ending at j."""
+    j = _skip_ws_back(text, j)
+    if j >= 1 and text[j - 1 : j + 1] == "]]":
+        depth = 0
+        p = j
+        while p >= 1:
+            if text[p - 1 : p + 1] == "]]":
+                depth += 1
+                p -= 2
+                continue
+            if text[p - 1 : p + 1] == "[[":
+                depth -= 1
+                p -= 2
+                if depth == 0:
+                    return _skip_ws_back(text, p)
+                continue
+            p -= 1
+    return j
 
-    j = _skip_ws_back(text, brace_open - 1)
-    # Strip trailing qualifiers after parameter list
-    for _ in range(40):
+
+def _find_param_close_back(text: str, j: int) -> int | None:
+    """From position just before `{` / `;` / `=`, find `)` that closes the param list."""
+    j = _skip_ws_back(text, j)
+    j = _skip_attr_back(text, j)
+    for _ in range(50):
         if j < 0:
             return None
-        chunk_end = j
         matched = False
-        for kw in ("override", "final", "const", "volatile", "mutable"):
+        for kw in _TRAILING_KW:
             L = len(kw)
             if j >= L - 1 and text[j - L + 1 : j + 1] == kw:
-                # boundary check
                 b = j - L
                 if b < 0 or not (text[b].isalnum() or text[b] == "_"):
                     j = _skip_ws_back(text, j - L)
@@ -333,7 +392,6 @@ def parse_function_at_brace(text: str, brace_open: int) -> tuple[str, int, int, 
         if matched:
             continue
         if j >= 0 and text[j] == ")":
-            # Could be end of param list OR noexcept(...)
             d = 0
             p = j
             while p >= 0:
@@ -347,18 +405,11 @@ def parse_function_at_brace(text: str, brace_open: int) -> tuple[str, int, int, 
             if p < 0:
                 return None
             before = _skip_ws_back(text, p - 1)
-            ident, _ = _read_ident_back(text, before)
-            if ident == "noexcept" or ident.endswith("noexcept"):
-                j = _skip_ws_back(text, before - (len("noexcept")))
-                # actually before already at end of noexcept
-                j = _skip_ws_back(text, p - 1)
-                # re-read: p points to '(' of noexcept(
-                ident2, i2 = _read_ident_back(text, _skip_ws_back(text, p - 1))
-                if ident2 == "noexcept":
-                    j = _skip_ws_back(text, i2)
-                    continue
-            # This ')' closes the parameter list
-            break
+            ident, i2 = _read_ident_back(text, before)
+            if ident == "noexcept":
+                j = _skip_ws_back(text, i2)
+                continue
+            return j
         if j >= 1 and text[j - 1 : j + 1] == "->":
             j = _skip_ws_back(text, j - 2)
             while j >= 0 and text[j] != ")":
@@ -368,52 +419,116 @@ def parse_function_at_brace(text: str, brace_open: int) -> tuple[str, int, int, 
             j = _skip_ws_back(text, j - 1)
             continue
         return None
+    return None
 
-    if j < 0 or text[j] != ")":
-        return None
 
-    # Match '(' of parameter list
-    d = 0
-    p = j
-    while p >= 0:
-        if text[p] == ")":
-            d += 1
-        elif text[p] == "(":
-            d -= 1
-            if d == 0:
-                break
-        p -= 1
-    if p < 0:
-        return None
-    paren_open = p
-
-    k = _skip_ws_back(text, paren_open - 1)
-    qname, name_start = _read_ident_back(text, k)
-    if not qname:
-        return None
-    if _looks_like_control_or_type(text, name_start, qname):
-        return None
-    # Reject if immediately after '=' (lambda) : ](
+def _has_return_type_or_ctor(
+    text: str, name_start: int, qname: str, class_stack: list[str]
+) -> bool:
+    """Reject bare call-statements like `bar();`; allow ctors/dtors in class."""
+    simple = qname.split("::")[-1]
+    bare = simple.lstrip("~")
+    if class_stack and (bare == class_stack[-1] or simple == "~" + class_stack[-1]):
+        return True
+    # Out-of-line Class::Class / Class::~Class
+    parts = qname.split("::")
+    if len(parts) >= 2:
+        if parts[-1] == parts[-2] or parts[-1] == "~" + parts[-2]:
+            return True
     pre = _skip_ws_back(text, name_start - 1)
-    if pre >= 0 and text[pre] in {"=", "[", "]", "(", ","}:
-        # likely lambda or call, not a definition name — definitions have return type before name
-        # Allow Class::Method where pre is letter from return type — OK
-        if text[pre] in {"=", "["}:
-            return None
+    if pre < 0:
+        return False
+    if text[pre] in {"=", "[", "]", "(", ",", ";", "{", "}"}:
+        # decltype(auto) Name — pre is ')'
+        if text[pre] == ")":
+            d = 0
+            p = pre
+            while p >= 0:
+                if text[p] == ")":
+                    d += 1
+                elif text[p] == "(":
+                    d -= 1
+                    if d == 0:
+                        break
+                p -= 1
+            if p >= 0:
+                ident, _ = _read_ident_back(text, _skip_ws_back(text, p - 1))
+                if ident == "decltype":
+                    return True
+        return False
+    if text[pre] in {"*", "&", ">", ":"}:
+        return True
+    ident, _ = _read_ident_back(text, pre)
+    if not ident:
+        return False
+    if ident in {
+        "if",
+        "for",
+        "while",
+        "switch",
+        "return",
+        "sizeof",
+        "case",
+        "catch",
+        "else",
+    }:
+        return False
+    return True
+
+
+def parse_function_at_brace(
+    text: str, brace_open: int, class_stack: list[str] | None = None
+) -> tuple[str, int, int, int] | None:
+    """If `{` starts a function body, return (qname, name_start, body_lo, body_hi)."""
+    class_stack = class_stack or []
+    body_hi = find_matching_brace(text, brace_open)
+    if body_hi < 0:
+        return None
+    paren_close = _find_param_close_back(text, brace_open - 1)
+    if paren_close is None:
+        return None
+    parsed = _read_func_name_before_paren(text, paren_close)
+    if not parsed:
+        return None
+    qname, name_start = parsed
+    if not _has_return_type_or_ctor(text, name_start, qname, class_stack):
+        return None
     return qname, name_start, brace_open, body_hi
 
 
-def iter_function_defs(
-    text: str, max_funcs: int = 8000
-) -> list[tuple[str, int, int, int, str]]:
-    """Return (local_qname, name_start, body_lo, body_hi, namespace).
+def parse_function_at_semicolon(
+    text: str, semi: int, class_stack: list[str] | None = None
+) -> tuple[str, int] | None:
+    """If `;` ends a function declaration / =default / =delete, return (qname, name_start)."""
+    class_stack = class_stack or []
+    j = _skip_ws_back(text, semi - 1)
+    # = default / = delete
+    if j >= 0 and text[j] in "tede":
+        for kw in ("default", "delete"):
+            L = len(kw)
+            if j >= L - 1 and text[j - L + 1 : j + 1] == kw:
+                b = j - L
+                if b < 0 or not (text[b].isalnum() or text[b] == "_"):
+                    j = _skip_ws_back(text, j - L)
+                    if j >= 0 and text[j] == "=":
+                        j = _skip_ws_back(text, j - 1)
+                    break
+    paren_close = _find_param_close_back(text, j)
+    if paren_close is None:
+        return None
+    parsed = _read_func_name_before_paren(text, paren_close)
+    if not parsed:
+        return None
+    qname, name_start = parsed
+    if not _has_return_type_or_ctor(text, name_start, qname, class_stack):
+        return None
+    return qname, name_start
 
-    namespace is A::B enclosing namespaces (not including class scope in v1.3 —
-    class methods still appear as Class::Method when written that way in source).
-    """
-    out: list[tuple[str, int, int, int, str]] = []
-    # Precompute namespace regions via brace stack of namespace opens
-    ns_events: list[tuple[int, str, str]] = []  # (pos, 'push'|'pop', name)
+
+def _collect_brace_scopes(text: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Return (ns_push_at_brace, class_push_at_brace)."""
+    ns_push: dict[int, str] = {}
+    class_push: dict[int, str] = {}
     i = 0
     n = len(text)
     while i < n:
@@ -422,97 +537,161 @@ def iter_function_defs(
         ):
             m = _NS_START.match(text, i)
             if m:
-                # find {
                 brace = text.find("{", m.end() - 1)
                 if brace > 0:
-                    ns_events.append((brace, "push", m.group(1).replace(" ", "")))
+                    ns_push[brace] = m.group(1).replace(" ", "")
                     i = brace + 1
                     continue
             m2 = _NS_ANON.match(text, i)
             if m2:
                 brace = text.find("{", m2.end() - 1)
                 if brace > 0:
-                    ns_events.append((brace, "push", ""))
+                    ns_push[brace] = ""
                     i = brace + 1
                     continue
+        # skip enum class / enum struct — not a method container we care about
+        if text.startswith("enum", i) and (
+            i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
+            i += 4
+            continue
+        m = _CLASS_START.match(text, i)
+        if m:
+            brace = text.find("{", m.end() - 1)
+            if brace > 0 and brace - m.start() < 220:
+                class_push[brace] = m.group(1)
+                i = brace + 1
+                continue
         i += 1
+    return ns_push, class_push
 
-    # Map each namespace push brace to its matching close, build stack timeline
-    # Simpler: while scanning for function braces, maintain ns_stack using events
-    push_at = {pos: name for pos, kind, name in ns_events if kind == "push"}
 
+def _qualify_with_class(local_qname: str, class_stack: list[str]) -> str:
+    if not class_stack:
+        return local_qname
+    if "::" in local_qname:
+        return local_qname
+    return f"{'::'.join(class_stack)}::{local_qname}"
+
+
+def iter_functions(
+    text: str, max_funcs: int = 12000
+) -> list[tuple[str, int, int, int, str, str]]:
+    """Return (local_qname, name_start, body_lo, body_hi, namespace, kind).
+
+    kind is 'function' (definition with body) or 'declaration'.
+    body_lo/body_hi are -1 for declarations.
+    namespace includes enclosing namespaces only (class is baked into local_qname).
+    """
+    out: list[tuple[str, int, int, int, str, str]] = []
+    ns_push, class_push = _collect_brace_scopes(text)
+    n = len(text)
     ns_stack: list[str] = []
-    ns_brace_stack: list[int] = []  # brace positions that opened namespaces
+    class_stack: list[str] = []
+    # stack of (kind, open_brace) for ns/class only
+    scope_braces: list[tuple[str, int]] = []
+    # function body ranges to skip when hunting declarations
+    def_ranges: list[tuple[int, int]] = []
+
+    def in_def_body(pos: int) -> bool:
+        for lo, hi in def_ranges:
+            if lo < pos < hi:
+                return True
+        return False
+
     i = 0
     while i < n and len(out) < max_funcs:
-        if i in push_at:
-            ns_stack.append(push_at[i])
-            ns_brace_stack.append(i)
+        if i in ns_push:
+            ns_stack.append(ns_push[i])
+            scope_braces.append(("ns", i))
             i += 1
             continue
-        if text[i] == "}" and ns_brace_stack:
-            # May close namespace — check if this closes the innermost ns brace
-            open_b = ns_brace_stack[-1]
+        if i in class_push:
+            class_stack.append(class_push[i])
+            scope_braces.append(("class", i))
+            i += 1
+            continue
+        if text[i] == "}" and scope_braces:
+            kind, open_b = scope_braces[-1]
             close_b = find_matching_brace(text, open_b)
             if close_b == i:
-                ns_brace_stack.pop()
-                if ns_stack:
+                scope_braces.pop()
+                if kind == "ns" and ns_stack:
                     ns_stack.pop()
+                elif kind == "class" and class_stack:
+                    class_stack.pop()
                 i += 1
                 continue
-        if text[i] != "{":
-            i += 1
-            continue
-        # skip namespace braces themselves
-        if i in push_at:
-            i += 1
-            continue
-        j = _skip_ws_back(text, i - 1)
-        probe = j
-        ok = False
-        for _ in range(20):
-            if probe < 0:
-                break
-            if text[probe] == ")":
-                ok = True
-                break
-            advanced = False
-            for kw in ("override", "final", "const", "volatile", "noexcept"):
-                L = len(kw)
-                if probe >= L - 1 and text[probe - L + 1 : probe + 1] == kw:
-                    b = probe - L
-                    if b < 0 or not (text[b].isalnum() or text[b] == "_"):
-                        probe = _skip_ws_back(text, probe - L)
-                        advanced = True
-                        break
-            if advanced:
-                continue
-            if probe >= 0 and text[probe] == ")":
-                d = 0
-                p = probe
-                while p >= 0:
-                    if text[p] == ")":
-                        d += 1
-                    elif text[p] == "(":
-                        d -= 1
-                        if d == 0:
+
+        if text[i] == "{":
+            # probe: function definition?
+            j = _skip_ws_back(text, i - 1)
+            probe = j
+            ok = False
+            for _ in range(24):
+                if probe < 0:
+                    break
+                if text[probe] == ")":
+                    ok = True
+                    break
+                advanced = False
+                for kw in _TRAILING_KW:
+                    L = len(kw)
+                    if probe >= L - 1 and text[probe - L + 1 : probe + 1] == kw:
+                        b = probe - L
+                        if b < 0 or not (text[b].isalnum() or text[b] == "_"):
+                            probe = _skip_ws_back(text, probe - L)
+                            advanced = True
                             break
-                    p -= 1
-                probe = _skip_ws_back(text, p - 1) if p >= 0 else -1
-                continue
-            break
-        if not ok:
+                if advanced:
+                    continue
+                if probe >= 1 and text[probe - 1 : probe + 1] == "]]":
+                    probe = _skip_attr_back(text, probe)
+                    continue
+                break
+            if ok and i not in ns_push and i not in class_push:
+                parsed = parse_function_at_brace(text, i, class_stack)
+                if parsed:
+                    local_qname, name_start, lo, hi = parsed
+                    local_qname = _qualify_with_class(local_qname, class_stack)
+                    ns = "::".join(x for x in ns_stack if x)
+                    out.append((local_qname, name_start, lo, hi, ns, "function"))
+                    def_ranges.append((lo, hi))
+                    i = hi + 1
+                    continue
             i += 1
             continue
-        parsed = parse_function_at_brace(text, i)
-        if parsed:
-            local_qname, name_start, lo, hi = parsed
-            ns = "::".join(x for x in ns_stack if x)
-            out.append((local_qname, name_start, lo, hi, ns))
-            i = hi + 1
+
+        if text[i] == ";" and not in_def_body(i):
+            parsed = parse_function_at_semicolon(text, i, class_stack)
+            if parsed:
+                local_qname, name_start = parsed
+                local_qname = _qualify_with_class(local_qname, class_stack)
+                ns = "::".join(x for x in ns_stack if x)
+                # = default / = delete are definitions without a brace body
+                window = text[max(0, i - 24) : i]
+                kind = (
+                    "function"
+                    if re.search(r"=\s*(?:default|delete)\s*$", window)
+                    else "declaration"
+                )
+                out.append((local_qname, name_start, -1, -1, ns, kind))
+            i += 1
             continue
+
         i += 1
     return out
+
+
+# Back-compat alias
+def iter_function_defs(
+    text: str, max_funcs: int = 8000
+) -> list[tuple[str, int, int, int, str]]:
+    return [
+        (q, ns_start, lo, hi, ns)
+        for q, ns_start, lo, hi, ns, kind in iter_functions(text, max_funcs)
+        if kind == "function"
+    ]
 
 
 def _qualify(local_qname: str, namespace: str) -> str:
@@ -573,34 +752,56 @@ def extract_file(
         return out
 
     clean = strip_noise(text)
-    defs = iter_function_defs(clean)
+    funcs = iter_functions(clean)
     seen_qnames: set[str] = set()
     bodies: list[tuple[str, int, int, str]] = []
+    # Definitions first so declarations don't steal the canonical qname
+    ordered = [f for f in funcs if f[5] == 'function'] + [
+        f for f in funcs if f[5] == 'declaration'
+    ]
 
-    for local_qname, name_start, body_lo, body_hi, ns in defs:
+    for local_qname, name_start, body_lo, body_hi, ns, kind in ordered:
         qname = _qualify(local_qname, ns)
-        name = local_qname.split('::')[-1]
+        leaf = local_qname.split('::')[-1]
+        name = leaf
         uniq = qname
         if uniq in seen_qnames:
+            # Same symbol already recorded (usually definition) — skip extra decl
+            if kind == 'declaration':
+                continue
             uniq = f'{qname}@{line_of(clean, name_start)}'
         seen_qnames.add(uniq)
-        body_txt = clean[body_lo : body_hi + 1]
-        is_coro = bool(_CORO_KW.search(body_txt))
-        head = clean[max(0, name_start - 80) : name_start]
-        if any(t in head for t in coro_types):
-            is_coro = True
+        is_coro = False
         domain, backend = 'cpu', 'host'
-        hit = match_device(body_txt, rules) or match_device(name, rules)
-        if hit:
-            domain, backend = hit
+        if kind == 'function' and body_lo >= 0:
+            body_txt = clean[body_lo : body_hi + 1]
+            is_coro = bool(_CORO_KW.search(body_txt))
+            head = clean[max(0, name_start - 80) : name_start]
+            if any(t in head for t in coro_types):
+                is_coro = True
+            hit = match_device(body_txt, rules) or match_device(name, rules)
+            if hit:
+                domain, backend = hit
+        else:
+            head = clean[max(0, name_start - 80) : name_start]
+            if any(t in head for t in coro_types):
+                is_coro = True
+            hit = match_device(name, rules)
+            if hit:
+                domain, backend = hit
+        node_kind = (
+            'coroutine'
+            if is_coro
+            else ('function' if kind == 'function' else 'declaration')
+        )
         out.nodes.append(
             RawNode(
                 name=name,
                 qualified_name=uniq,
-                kind='coroutine' if is_coro else 'function',
+                kind=node_kind,
                 file_path=rel,
                 start_line=line_of(clean, name_start),
-                end_line=line_of(clean, body_hi),
+                end_line=line_of(clean, body_hi if body_hi >= 0 else name_start),
                 domain=domain,
                 backend=backend,
                 signature=uniq,
@@ -609,10 +810,13 @@ def extract_file(
                 namespace=ns,
             )
         )
-        bodies.append((uniq, body_lo, body_hi, ns))
+        if kind == 'function' and body_lo >= 0:
+            bodies.append((uniq, body_lo, body_hi, ns))
 
     body_triples = [(q, lo, hi) for q, lo, hi, _ in bodies]
     ns_of = {q: ns for q, _, _, ns in bodies}
+    for n in out.nodes:
+        ns_of.setdefault(n.qualified_name, n.namespace)
 
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
         for m in rx.finditer(clean):

@@ -5,10 +5,12 @@ Syntax-level **C++17 coroutine + device-domain** graph.
 
 What V1 can do:
 
+- **All functions as nodes**: definitions `{...}` **and** declarations `Foo();` / `= default` / `= delete` (headers included)
+- Class/struct members qualified as `Class::Method` (incl. ctor/dtor)
 - Find `exec::task<…> Name` / functions with `co_await` / `co_return`
-- Draw **`await`** edges from `co_await Foo(…)`
+- Draw **`await`** edges from `co_await Foo(…)` plus normal **`calls`**
 - Tag **device domains** (`cpu` / `gpu` / `npu` / `dsp`) via `rules/devices.json`
-- SQLite DB + HTML visualization + minimal MCP (`coro_explore`, `coro_stats`)
+- SQLite DB + HTML visualization + CLI (`query` / `callers` / `callees` / `explore`) + MCP
 
 What V1 cannot do:
 
