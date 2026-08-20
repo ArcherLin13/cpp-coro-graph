@@ -9,6 +9,7 @@ What V1 can do:
 - Class/struct members qualified as `Class::Method` (incl. ctor/dtor)
 - Find `exec::task<…> Name` / functions with `co_await` / `co_return`
 - Draw **`await`** edges from `co_await Foo(…)` plus normal **`calls`**
+- **Member pipeline**: `co_await m.Init()` inside `SosModel::Call` resolves to `SosModel::Init` (enclosing class + local `SosModel m`)
 - Tag **device domains** (`cpu` / `gpu` / `npu` / `dsp`) via `rules/devices.json`
 - SQLite DB + HTML visualization + CLI (`query` / `callers` / `callees` / `explore`) + MCP
 

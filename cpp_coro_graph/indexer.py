@@ -108,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1.5-seq-contains")
-    store.upsert_meta(conn, "version", "0.3.3")
+    store.upsert_meta(conn, "mode", "syntax-v1.6-member-await")
+    store.upsert_meta(conn, "version", "0.3.4")
 
     extracts: list[FileExtract] = []
     total = len(files)

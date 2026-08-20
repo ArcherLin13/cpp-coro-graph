@@ -69,9 +69,12 @@ class SymbolIndex:
         consider(t)
         consider(t.lstrip(":"))
         if from_namespace:
-            consider(f"{from_namespace}::{t}" if "::" not in t else t)
+            consider(f"{from_namespace}::{t}")
+            if "::" not in t:
+                consider(f"{from_namespace}::{t}")
             parts = from_namespace.split("::")
             for i in range(len(parts) - 1, 0, -1):
+                consider(f"{'::'.join(parts[:i])}::{t}")
                 consider(f"{'::'.join(parts[:i])}::{t.split('::')[-1]}")
         for u in usings:
             if u.endswith("::"):

@@ -27,7 +27,14 @@ _CO_AWAIT = re.compile(
     re.M,
 )
 _CO_AWAIT_MACRO = re.compile(
-    r"\b(?:CO_AWAIT|COAWAIT|CoAwait)\s*\(\s*(?P<target>[A-Za-z_][\w:]*)",
+    r"\b(?:CO_AWAIT|COAWAIT|CoAwait)\s*\(\s*"
+    r"(?P<target>[A-Za-z_][\w:]*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)",
+    re.M,
+)
+# Local object: Type var; / Type var{...}; / Type var(...); / Type* var =
+_LOCAL_OBJ = re.compile(
+    r"\b(?P<type>[A-Za-z_][\w:]*)\s*(?:const\s*)?(?:\*|&)?\s*"
+    r"(?P<var>[A-Za-z_]\w*)\s*(?:[=;({]|\{)",
     re.M,
 )
 _CORO_KW = re.compile(r"\b(?:co_await|co_return|co_yield|CO_AWAIT|COAWAIT|CoAwait)\b")
@@ -719,6 +726,112 @@ def _owner_at(bodies: list[tuple[str, int, int]], idx: int) -> str | None:
     return owner
 
 
+def _enclosing_class(qname: str) -> str | None:
+    """ns::SosModel::Call → ns::SosModel; free function → None."""
+    if qname.startswith("file:"):
+        return None
+    parts = qname.split("::")
+    if len(parts) < 2:
+        return None
+    return "::".join(parts[:-1])
+
+
+def _locals_in_body(chunk: str) -> dict[str, str]:
+    """Map local var name → type name (best-effort syntax)."""
+    out: dict[str, str] = {}
+    skip_types = _CALL_KEYWORDS | {
+        "return",
+        "co_return",
+        "co_await",
+        "co_yield",
+        "else",
+        "typedef",
+        "using",
+        "namespace",
+        "class",
+        "struct",
+        "enum",
+        "public",
+        "private",
+        "protected",
+        "template",
+        "typename",
+        "static",
+        "constexpr",
+        "consteval",
+        "constinit",
+        "inline",
+        "virtual",
+        "explicit",
+        "friend",
+        "mutable",
+        "volatile",
+        "register",
+        "extern",
+        "auto",  # auto x = T{} — type unknown; skip
+    }
+    for m in _LOCAL_OBJ.finditer(chunk):
+        typ = m.group("type")
+        var = m.group("var")
+        if typ in skip_types or var in skip_types:
+            continue
+        if typ in {"int", "bool", "char", "void", "float", "double", "size_t", "uint32_t", "int32_t"}:
+            continue
+        # Prefer first declaration of var
+        out.setdefault(var, typ)
+    return out
+
+
+def _qualify_member_target(
+    raw_target: str,
+    *,
+    owner_qname: str,
+    locals_map: dict[str, str],
+) -> str:
+    """Turn w.Init / ptr->Run into SosModel::Init when type is known."""
+    t = _normalize_target(raw_target)
+    method = t
+    recv = ""
+    if "->" in t:
+        recv, method = t.rsplit("->", 1)
+    elif "." in t:
+        recv, method = t.rsplit(".", 1)
+    method = method.split("::")[-1]
+
+    type_name = ""
+    if recv:
+        base = recv.split("::")[-1]
+        type_name = locals_map.get(base, "")
+    if not type_name:
+        enc = _enclosing_class(owner_qname)
+        if enc:
+            type_name = enc.split("::")[-1]
+            # Keep full enclosing for qualification when possible
+            full_enc = enc
+        else:
+            full_enc = ""
+    else:
+        # If local type is short, prefer owner namespace prefix
+        enc = _enclosing_class(owner_qname)
+        if enc and "::" in enc and "::" not in type_name:
+            # SosModel local inside demo::SosModel::Call → demo::SosModel
+            if enc.endswith("::" + type_name) or enc.split("::")[-1] == type_name:
+                full_enc = enc
+            else:
+                ns = "::".join(enc.split("::")[:-1])
+                full_enc = f"{ns}::{type_name}" if ns else type_name
+        elif enc and enc.split("::")[-1] == type_name:
+            full_enc = enc
+        else:
+            full_enc = type_name
+
+    if full_enc and method:
+        return f"{full_enc}::{method}"
+    if method:
+        return method
+    return t
+
+
 def extract_file(
     path: Path,
     rel: str,
@@ -818,12 +931,15 @@ def extract_file(
     for n in out.nodes:
         ns_of.setdefault(n.qualified_name, n.namespace)
 
+    locals_by_owner: dict[str, dict[str, str]] = {}
+    for qn, lo, hi, _ns in bodies:
+        locals_by_owner[qn] = _locals_in_body(clean[lo : hi + 1])
+
     # Collect awaits in source order, then emit await + seq edges.
     awaits: list[tuple[int, str, str, str, str]] = []  # idx, target, owner, domain, backend
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
         for m in rx.finditer(clean):
             idx = m.start()
-            target = _normalize_target(m.group('target'))
             owner = _owner_at(body_triples, idx)
             if owner is None:
                 file_node = f'file:{rel}'
@@ -840,6 +956,11 @@ def extract_file(
                         )
                     )
                 owner = file_node
+            target = _qualify_member_target(
+                m.group('target'),
+                owner_qname=owner,
+                locals_map=locals_by_owner.get(owner, {}),
+            )
             domain, backend = 'unknown', ''
             hit = match_device(target, rules)
             if hit:
@@ -914,13 +1035,31 @@ def extract_file(
 
     for qn, lo, hi, ns in bodies:
         chunk = clean[lo : hi + 1]
+        loc_map = locals_by_owner.get(qn, {})
         for m in _CALL.finditer(chunk):
             name = m.group('name')
             simple = name.split('::')[-1]
             if simple in _CALL_KEYWORDS or name in _CALL_KEYWORDS:
                 continue
             abs_idx = lo + m.start()
-            target = _normalize_target(name)
+            # Recover obj.method from match prefix when present
+            raw = m.group(0)
+            member = re.match(
+                r'([A-Za-z_][\w:]*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(',
+                raw,
+            )
+            if member:
+                target = _qualify_member_target(
+                    f"{member.group(1)}.{member.group(2)}",
+                    owner_qname=qn,
+                    locals_map=loc_map,
+                )
+            else:
+                target = _qualify_member_target(
+                    name,
+                    owner_qname=qn,
+                    locals_map=loc_map,
+                )
             kind = classify_call_kind(target, thread_rules)
             out.edges.append(
                 RawEdge(
@@ -929,7 +1068,7 @@ def extract_file(
                     kind=kind,
                     file_path=rel,
                     line=line_of(clean, abs_idx),
-                    raw_target=m.group(0)[:80],
+                    raw_target=raw[:80],
                     source_namespace=ns,
                 )
             )
