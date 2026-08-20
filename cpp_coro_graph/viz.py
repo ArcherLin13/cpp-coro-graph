@@ -19,6 +19,8 @@ EDGE_COLOR = {
     "await": "#ef4444",
     "calls": "#38bdf8",
     "device_call": "#f59e0b",
+    "handoff": "#a855f7",
+    "spawns": "#ec4899",
 }
 
 
@@ -83,6 +85,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <option value="">all edges</option>
     <option value="calls">calls</option>
     <option value="await">await</option>
+    <option value="handoff">handoff</option>
+    <option value="spawns">spawns</option>
     <option value="device_call">device_call</option>
   </select>
   <label class="chip"><input type="checkbox" id="hideUnresolved"/> hide unresolved</label>
@@ -92,6 +96,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <span class="chip"><span class="dot" style="background:#f59e0b"></span>npu</span>
   <span class="chip"><span class="dot" style="background:#38bdf8"></span>calls</span>
   <span class="chip"><span class="dot" style="background:#ef4444"></span>await</span>
+  <span class="chip"><span class="dot" style="background:#a855f7"></span>handoff</span>
+  <span class="chip"><span class="dot" style="background:#ec4899"></span>spawns</span>
   <span id="meta"></span>
 </div>
 <div id="net"></div>

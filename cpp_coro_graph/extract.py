@@ -119,6 +119,7 @@ class RawNode:
     signature: str = ""
     body_lo: int = -1
     body_hi: int = -1
+    namespace: str = ""
 
 
 @dataclass
@@ -131,6 +132,7 @@ class RawEdge:
     domain: str = "unknown"
     backend: str = ""
     raw_target: str = ""
+    source_namespace: str = ""
 
 
 @dataclass
@@ -141,6 +143,7 @@ class FileExtract:
     device_hits: list[dict[str, Any]] = field(default_factory=list)
     skipped: str = ""
     has_coro_kw: bool = False
+    usings: list[str] = field(default_factory=list)
 
 
 def strip_noise(src: str) -> str:
@@ -189,6 +192,60 @@ def load_coro_types(path: Path | None = None) -> tuple[str, ...]:
             names = data.get("return_type_names") or []
             return tuple(dict.fromkeys([*DEFAULT_CORO_TYPES, *names]))
     return DEFAULT_CORO_TYPES
+
+
+def load_thread_rules(path: Path | None = None) -> list[dict[str, str]]:
+    candidates = []
+    if path:
+        candidates.append(path)
+    candidates.extend(
+        [
+            Path(__file__).resolve().parent / "rules" / "thread_apis.json",
+            Path(__file__).resolve().parent.parent / "rules" / "thread_apis.json",
+        ]
+    )
+    for p in candidates:
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return list(data.get("patterns") or [])
+    return []
+
+
+def classify_call_kind(target: str, thread_rules: list[dict[str, str]]) -> str:
+    """Return calls | handoff | spawns based on thread API rules."""
+    for rule in thread_rules:
+        needle = rule.get("match") or ""
+        if needle and needle in target:
+            return rule.get("kind") or "handoff"
+    simple = target.split("::")[-1]
+    for rule in thread_rules:
+        needle = rule.get("match") or ""
+        if needle and (needle == simple or needle.endswith("::" + simple)):
+            return rule.get("kind") or "handoff"
+    return "calls"
+
+
+def extract_usings(text: str) -> list[str]:
+    out: list[str] = []
+    for m in re.finditer(r"\busing\s+namespace\s+([A-Za-z_][\w:]*)\s*;", text):
+        out.append(m.group(1))
+    for m in re.finditer(r"\busing\s+([A-Za-z_][\w:]*)\s*;", text):
+        # using foo::Bar; → treat as alias namespace foo for Bar resolution
+        q = m.group(1)
+        if "::" in q:
+            out.append(q.rsplit("::", 1)[0])
+            out.append(q)  # full for exact
+        else:
+            out.append(q)
+    # unique preserve order
+    return list(dict.fromkeys(out))
+
+
+_NS_START = re.compile(r"\bnamespace\s+([A-Za-z_][\w:]*)\s*\{")
+_NS_ANON = re.compile(r"\bnamespace\s*\{")
+_CLASS_START = re.compile(
+    r"\b(?:class|struct)\s+([A-Za-z_]\w*)\b[^;{]{0,200}\{"
+)
 
 
 def match_device(text: str, rules: list[dict[str, str]]) -> tuple[str, str] | None:
@@ -346,18 +403,71 @@ def parse_function_at_brace(text: str, brace_open: int) -> tuple[str, int, int, 
     return qname, name_start, brace_open, body_hi
 
 
-def iter_function_defs(text: str, max_funcs: int = 5000) -> list[tuple[str, int, int, int]]:
-    """Linear scan for function-definition bodies."""
-    out: list[tuple[str, int, int, int]] = []
+def iter_function_defs(
+    text: str, max_funcs: int = 8000
+) -> list[tuple[str, int, int, int, str]]:
+    """Return (local_qname, name_start, body_lo, body_hi, namespace).
+
+    namespace is A::B enclosing namespaces (not including class scope in v1.3 —
+    class methods still appear as Class::Method when written that way in source).
+    """
+    out: list[tuple[str, int, int, int, str]] = []
+    # Precompute namespace regions via brace stack of namespace opens
+    ns_events: list[tuple[int, str, str]] = []  # (pos, 'push'|'pop', name)
     i = 0
     n = len(text)
+    while i < n:
+        if text.startswith("namespace", i) and (
+            i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
+            m = _NS_START.match(text, i)
+            if m:
+                # find {
+                brace = text.find("{", m.end() - 1)
+                if brace > 0:
+                    ns_events.append((brace, "push", m.group(1).replace(" ", "")))
+                    i = brace + 1
+                    continue
+            m2 = _NS_ANON.match(text, i)
+            if m2:
+                brace = text.find("{", m2.end() - 1)
+                if brace > 0:
+                    ns_events.append((brace, "push", ""))
+                    i = brace + 1
+                    continue
+        i += 1
+
+    # Map each namespace push brace to its matching close, build stack timeline
+    # Simpler: while scanning for function braces, maintain ns_stack using events
+    push_at = {pos: name for pos, kind, name in ns_events if kind == "push"}
+
+    ns_stack: list[str] = []
+    ns_brace_stack: list[int] = []  # brace positions that opened namespaces
+    i = 0
     while i < n and len(out) < max_funcs:
+        if i in push_at:
+            ns_stack.append(push_at[i])
+            ns_brace_stack.append(i)
+            i += 1
+            continue
+        if text[i] == "}" and ns_brace_stack:
+            # May close namespace — check if this closes the innermost ns brace
+            open_b = ns_brace_stack[-1]
+            close_b = find_matching_brace(text, open_b)
+            if close_b == i:
+                ns_brace_stack.pop()
+                if ns_stack:
+                    ns_stack.pop()
+                i += 1
+                continue
         if text[i] != "{":
             i += 1
             continue
-        # Skip brace init / compound that isn't a function: require a ')' not far before
+        # skip namespace braces themselves
+        if i in push_at:
+            i += 1
+            continue
         j = _skip_ws_back(text, i - 1)
-        # Allow const/override/... between ) and {
         probe = j
         ok = False
         for _ in range(20):
@@ -366,7 +476,6 @@ def iter_function_defs(text: str, max_funcs: int = 5000) -> list[tuple[str, int,
             if text[probe] == ")":
                 ok = True
                 break
-            # walk back over a keyword
             advanced = False
             for kw in ("override", "final", "const", "volatile", "noexcept"):
                 L = len(kw)
@@ -379,7 +488,6 @@ def iter_function_defs(text: str, max_funcs: int = 5000) -> list[tuple[str, int,
             if advanced:
                 continue
             if probe >= 0 and text[probe] == ")":
-                # noexcept(
                 d = 0
                 p = probe
                 while p >= 0:
@@ -398,12 +506,22 @@ def iter_function_defs(text: str, max_funcs: int = 5000) -> list[tuple[str, int,
             continue
         parsed = parse_function_at_brace(text, i)
         if parsed:
-            qname, name_start, lo, hi = parsed
-            out.append((qname, name_start, lo, hi))
+            local_qname, name_start, lo, hi = parsed
+            ns = "::".join(x for x in ns_stack if x)
+            out.append((local_qname, name_start, lo, hi, ns))
             i = hi + 1
             continue
         i += 1
     return out
+
+
+def _qualify(local_qname: str, namespace: str) -> str:
+    if not namespace:
+        return local_qname
+    if local_qname.startswith(namespace + "::"):
+        return local_qname
+    # Class::Method already qualified — still nest under namespace
+    return f"{namespace}::{local_qname}"
 
 
 def _normalize_target(raw: str) -> str:
@@ -427,51 +545,51 @@ def extract_file(
     rel: str,
     rules: list[dict[str, str]],
     coro_types: tuple[str, ...] | None = None,
+    thread_rules: list[dict[str, str]] | None = None,
 ) -> FileExtract:
     out = FileExtract(path=rel)
     coro_types = coro_types or DEFAULT_CORO_TYPES
+    thread_rules = thread_rules if thread_rules is not None else load_thread_rules()
     try:
         size = path.stat().st_size
     except OSError:
-        out.skipped = "stat-failed"
+        out.skipped = 'stat-failed'
         return out
 
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding='utf-8', errors='replace')
     except OSError:
-        out.skipped = "read-failed"
+        out.skipped = 'read-failed'
         return out
 
     out.has_coro_kw = bool(_CORO_KW.search(text))
-    has_device = any((r.get("match") or "") in text for r in rules)
+    out.usings = extract_usings(text)
+    has_device = any((r.get('match') or '') in text for r in rules)
 
     if size > MAX_FULL_PARSE_BYTES:
-        out.skipped = f"too-large:{size}"
+        out.skipped = f'too-large:{size}'
         return out
-
-    # Always parse C/C++ for call graph (user expects normal call chains).
-    # Skip empty-ish files.
     if len(text) < 3:
         return out
 
     clean = strip_noise(text)
     defs = iter_function_defs(clean)
     seen_qnames: set[str] = set()
-    bodies: list[tuple[str, int, int]] = []
+    bodies: list[tuple[str, int, int, str]] = []
 
-    for qname, name_start, body_lo, body_hi in defs:
-        name = qname.split("::")[-1]
+    for local_qname, name_start, body_lo, body_hi, ns in defs:
+        qname = _qualify(local_qname, ns)
+        name = local_qname.split('::')[-1]
         uniq = qname
         if uniq in seen_qnames:
-            uniq = f"{qname}@{line_of(clean, name_start)}"
+            uniq = f'{qname}@{line_of(clean, name_start)}'
         seen_qnames.add(uniq)
         body_txt = clean[body_lo : body_hi + 1]
         is_coro = bool(_CORO_KW.search(body_txt))
-        # Also treat task-like return nearby as coroutine hint
         head = clean[max(0, name_start - 80) : name_start]
         if any(t in head for t in coro_types):
             is_coro = True
-        domain, backend = "cpu", "host"
+        domain, backend = 'cpu', 'host'
         hit = match_device(body_txt, rules) or match_device(name, rules)
         if hit:
             domain, backend = hit
@@ -479,7 +597,7 @@ def extract_file(
             RawNode(
                 name=name,
                 qualified_name=uniq,
-                kind="coroutine" if is_coro else "function",
+                kind='coroutine' if is_coro else 'function',
                 file_path=rel,
                 start_line=line_of(clean, name_start),
                 end_line=line_of(clean, body_hi),
@@ -488,32 +606,35 @@ def extract_file(
                 signature=uniq,
                 body_lo=body_lo,
                 body_hi=body_hi,
+                namespace=ns,
             )
         )
-        bodies.append((uniq, body_lo, body_hi))
+        bodies.append((uniq, body_lo, body_hi, ns))
 
-    # co_await edges
+    body_triples = [(q, lo, hi) for q, lo, hi, _ in bodies]
+    ns_of = {q: ns for q, _, _, ns in bodies}
+
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
         for m in rx.finditer(clean):
             idx = m.start()
-            target = _normalize_target(m.group("target"))
-            owner = _owner_at(bodies, idx)
+            target = _normalize_target(m.group('target'))
+            owner = _owner_at(body_triples, idx)
             if owner is None:
-                file_node = f"file:{rel}"
+                file_node = f'file:{rel}'
                 if file_node not in seen_qnames:
                     seen_qnames.add(file_node)
                     out.nodes.append(
                         RawNode(
                             name=Path(rel).name,
                             qualified_name=file_node,
-                            kind="file",
+                            kind='file',
                             file_path=rel,
                             start_line=1,
                             end_line=1,
                         )
                     )
                 owner = file_node
-            domain, backend = "unknown", ""
+            domain, backend = 'unknown', ''
             hit = match_device(target, rules)
             if hit:
                 domain, backend = hit
@@ -521,63 +642,85 @@ def extract_file(
                 RawEdge(
                     source_qname=owner,
                     target_name=target,
-                    kind="await",
+                    kind='await',
                     file_path=rel,
                     line=line_of(clean, idx),
                     domain=domain,
                     backend=backend,
                     raw_target=m.group(0)[:120],
+                    source_namespace=ns_of.get(owner, ''),
                 )
             )
 
-    # Normal call edges inside each function body
-    for qn, lo, hi in bodies:
+    for qn, lo, hi, ns in bodies:
         chunk = clean[lo : hi + 1]
-        # Avoid counting the function's own declarator — body starts at '{'
         for m in _CALL.finditer(chunk):
-            name = m.group("name")
-            simple = name.split("::")[-1]
+            name = m.group('name')
+            simple = name.split('::')[-1]
             if simple in _CALL_KEYWORDS or name in _CALL_KEYWORDS:
                 continue
-            # skip placement that looks like a definition inside (rare)
             abs_idx = lo + m.start()
-            # Don't emit call to self name at the very start (declarator already outside body)
+            target = _normalize_target(name)
+            kind = classify_call_kind(target, thread_rules)
             out.edges.append(
                 RawEdge(
                     source_qname=qn,
-                    target_name=_normalize_target(name),
-                    kind="calls",
+                    target_name=target,
+                    kind=kind,
                     file_path=rel,
                     line=line_of(clean, abs_idx),
                     raw_target=m.group(0)[:80],
+                    source_namespace=ns,
                 )
             )
+            if kind in {'spawns', 'handoff'}:
+                rest = chunk[m.end() : m.end() + 120]
+                cm = re.match(r'\s*(?:&)?([A-Za-z_][\w:]*)', rest)
+                if cm:
+                    worker = _normalize_target(cm.group(1))
+                    if worker.split('::')[-1] not in _CALL_KEYWORDS and worker != target:
+                        out.edges.append(
+                            RawEdge(
+                                source_qname=qn,
+                                target_name=worker,
+                                kind='spawns',
+                                file_path=rel,
+                                line=line_of(clean, abs_idx),
+                                raw_target=f'via {target} -> {worker}',
+                                source_namespace=ns,
+                            )
+                        )
 
-    # Device API edges
     if has_device:
-        ranked = sorted(rules, key=lambda r: len(r.get("match") or ""), reverse=True)
+        ranked = sorted(rules, key=lambda r: len(r.get('match') or ''), reverse=True)
+        covered_ranges: list[tuple[int, int]] = []
         for rule in ranked:
-            needle = rule["match"]
+            needle = rule['match']
             start = 0
             while True:
                 idx = clean.find(needle, start)
                 if idx < 0:
                     break
-                owner = _owner_at(bodies, idx)
+                end = idx + len(needle)
+                if any(not (end <= a or idx >= b) for a, b in covered_ranges):
+                    start = idx + 1
+                    continue
+                covered_ranges.append((idx, end))
+                owner = _owner_at(body_triples, idx)
                 if owner is None:
-                    file_node = f"file:{rel}"
+                    file_node = f'file:{rel}'
                     if file_node not in seen_qnames:
                         seen_qnames.add(file_node)
                         out.nodes.append(
                             RawNode(
                                 name=Path(rel).name,
                                 qualified_name=file_node,
-                                kind="file",
+                                kind='file',
                                 file_path=rel,
                                 start_line=1,
                                 end_line=1,
-                                domain=rule.get("domain", "unknown"),
-                                backend=rule.get("backend", ""),
+                                domain=rule.get('domain', 'unknown'),
+                                backend=rule.get('backend', ''),
                             )
                         )
                     owner = file_node
@@ -585,22 +728,23 @@ def extract_file(
                     RawEdge(
                         source_qname=owner,
                         target_name=needle,
-                        kind="device_call",
+                        kind='device_call',
                         file_path=rel,
                         line=line_of(clean, idx),
-                        domain=rule.get("domain", "unknown"),
-                        backend=rule.get("backend", ""),
+                        domain=rule.get('domain', 'unknown'),
+                        backend=rule.get('backend', ''),
                         raw_target=needle,
+                        source_namespace=ns_of.get(owner, ''),
                     )
                 )
                 out.device_hits.append(
                     {
-                        "match": needle,
-                        "domain": rule.get("domain", "unknown"),
-                        "backend": rule.get("backend", ""),
-                        "line": line_of(clean, idx),
+                        'match': needle,
+                        'domain': rule.get('domain', 'unknown'),
+                        'backend': rule.get('backend', ''),
+                        'line': line_of(clean, idx),
                     }
                 )
-                start = idx + max(1, len(needle))
+                start = end
 
     return out

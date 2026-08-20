@@ -13,8 +13,10 @@ from .extract import (
     FileExtract,
     load_coro_types,
     load_device_rules,
+    load_thread_rules,
     extract_file,
 )
+from .resolve import SymbolIndex, SymbolRef
 from . import store
 
 SKIP_DIRS = {
@@ -46,7 +48,6 @@ SKIP_DIRS = {
 
 
 def log(msg: str) -> None:
-    """Progress to stderr so JSON stats on stdout stay clean if piped."""
     print(f"[cpp-coro-graph] {msg}", file=sys.stderr, flush=True)
 
 
@@ -90,7 +91,11 @@ def index_repo(
     log(f"db={db_path}")
     rules = load_device_rules(rules_path)
     coro_types = load_coro_types()
-    log(f"loaded {len(rules)} device rules, {len(coro_types)} coro type names")
+    thread_rules = load_thread_rules()
+    log(
+        f"loaded rules: devices={len(rules)} coro_types={len(coro_types)} "
+        f"thread_apis={len(thread_rules)}"
+    )
     files = iter_cpp_files(root)
     if max_files > 0:
         files = files[:max_files]
@@ -103,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1-no-compile-commands")
-    store.upsert_meta(conn, "version", "0.1.0")
+    store.upsert_meta(conn, "mode", "syntax-v1.3-crossfile-ns-thread")
+    store.upsert_meta(conn, "version", "0.3.0")
 
     extracts: list[FileExtract] = []
     total = len(files)
@@ -119,7 +124,9 @@ def index_repo(
         log(f"  parse start [{i}/{total}] {rel} ({sz} bytes)")
         t1 = time.time()
         try:
-            ex = extract_file(fp, rel, rules, coro_types=coro_types)
+            ex = extract_file(
+                fp, rel, rules, coro_types=coro_types, thread_rules=thread_rules
+            )
         except Exception as exc:  # noqa: BLE001
             log(f"  SKIP {rel}: {exc}")
             skipped += 1
@@ -140,19 +147,29 @@ def index_repo(
         )
     log(f"parse pass finished (skipped_or_light={skipped})")
 
-    log("building nodes ...")
-    by_qname: dict[str, str] = {}
-    by_name: dict[str, list[str]] = {}
+    log("building symbol index (cross-file / cross-namespace) ...")
+    index = SymbolIndex()
     node_count = 0
+    # Map extract-local qname -> node id (per file uniqueness via store.node_id)
+    local_to_id: dict[tuple[str, str], str] = {}
+
     for ex in extracts:
         for n in ex.nodes:
             nid = store.node_id(n.qualified_name, n.file_path, n.start_line)
-            by_qname[n.qualified_name] = nid
-            by_name.setdefault(n.name, []).append(nid)
+            local_to_id[(ex.path, n.qualified_name)] = nid
+            index.add(
+                SymbolRef(
+                    node_id=nid,
+                    name=n.name,
+                    qualified_name=n.qualified_name,
+                    file_path=n.file_path,
+                    namespace=n.namespace,
+                )
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO nodes"
                 "(id, name, qualified_name, kind, file_path, start_line, end_line, "
-                "domain, backend, signature) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "domain, backend, signature, namespace) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     nid,
                     n.name,
@@ -164,40 +181,42 @@ def index_repo(
                     n.domain,
                     n.backend,
                     n.signature,
+                    n.namespace,
                 ),
             )
             node_count += 1
-    for name, ids in by_name.items():
-        if len(ids) == 1 and name not in by_qname:
-            by_qname[name] = ids[0]
     log(f"nodes inserted: {node_count}")
 
-    log("building edges ...")
+    log("building edges with cross-file resolution ...")
     stub_ids: set[str] = set()
     edge_count = 0
+    resolved_cross = 0
+    unresolved = 0
     seen_edge_keys: set[tuple[str, str, str]] = set()
+
     for ex in extracts:
         for e in ex.edges:
-            src = by_qname.get(e.source_qname)
+            src = local_to_id.get((ex.path, e.source_qname))
             if not src:
                 continue
-            t = e.target_name.split("<", 1)[0]
-            simple = t.split("->")[-1].split(".")[-1].split("::")[-1]
-            tgt = None
-            if t in by_qname:
-                tgt = by_qname[t]
-            elif simple in by_name and len(by_name[simple]) == 1:
-                tgt = by_name[simple][0]
-            elif simple in by_name and len(by_name[simple]) > 1:
-                same = [
-                    i
-                    for i in by_name[simple]
-                    if i.startswith(e.file_path + "::")
-                ]
-                tgt = same[0] if same else None
-            if tgt is None:
-                stub_q = t
-                stub_id = f"unresolved::{stub_q}"
+            tgt = index.resolve(
+                e.target_name,
+                from_file=e.file_path,
+                from_namespace=e.source_namespace,
+                usings=ex.usings,
+            )
+            if tgt is not None:
+                # count as cross-file if target file differs
+                row = conn.execute(
+                    "SELECT file_path FROM nodes WHERE id=?", (tgt,)
+                ).fetchone()
+                if row and row["file_path"] != e.file_path:
+                    resolved_cross += 1
+            else:
+                unresolved += 1
+                t = e.target_name.split("<", 1)[0]
+                simple = t.split("->")[-1].split(".")[-1].split("::")[-1]
+                stub_id = f"unresolved::{t}"
                 tgt = stub_id
                 if stub_id not in stub_ids:
                     stub_ids.add(stub_id)
@@ -209,12 +228,12 @@ def index_repo(
                     conn.execute(
                         "INSERT OR REPLACE INTO nodes"
                         "(id, name, qualified_name, kind, file_path, start_line, "
-                        "end_line, domain, backend, signature) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        "end_line, domain, backend, signature, namespace) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             stub_id,
-                            simple or stub_q,
-                            stub_q,
+                            simple or t,
+                            t,
                             kind,
                             e.file_path,
                             e.line,
@@ -222,9 +241,9 @@ def index_repo(
                             domain,
                             backend,
                             "",
+                            "",
                         ),
                     )
-                    by_qname[stub_q] = stub_id
 
             key = (src, tgt, e.kind)
             if key in seen_edge_keys:
@@ -243,11 +262,22 @@ def index_repo(
                     e.line,
                     e.domain,
                     e.backend,
-                    json.dumps({"raw": e.raw_target}),
+                    json.dumps(
+                        {
+                            "raw": e.raw_target,
+                            "from_ns": e.source_namespace,
+                            "usings": ex.usings[:8],
+                        }
+                    ),
                 ),
             )
             edge_count += 1
-    log(f"edges inserted: {edge_count} (unresolved stubs: {len(stub_ids)})")
+
+    log(
+        f"edges inserted: {edge_count} "
+        f"(cross-file resolved hits~{resolved_cross}, "
+        f"unresolved stubs={len(stub_ids)}, unresolved edges={unresolved})"
+    )
 
     log("promoting device domains ...")
     for row in conn.execute(
@@ -263,6 +293,8 @@ def index_repo(
     s = store.stats(conn)
     s["root"] = str(root)
     s["db"] = str(db_path)
+    s["cross_file_resolve_hits"] = resolved_cross
+    s["unresolved_edge_attempts"] = unresolved
     conn.close()
     log(f"index done in {time.time() - t0:.1f}s -> {db_path}")
     return s

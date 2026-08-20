@@ -1,0 +1,27 @@
+{
+  "comment": "APIs that transfer work across threads / executors. Matched as call targets or substrings.",
+  "patterns": [
+    {"match": "std::thread", "kind": "spawns"},
+    {"match": "std::async", "kind": "spawns"},
+    {"match": "pthread_create", "kind": "spawns"},
+    {"match": "CreateThread", "kind": "spawns"},
+    {"match": "std::jthread", "kind": "spawns"},
+    {"match": "folly::CPUThreadPoolExecutor", "kind": "handoff"},
+    {"match": "asio::post", "kind": "handoff"},
+    {"match": "asio::dispatch", "kind": "handoff"},
+    {"match": "asio::co_spawn", "kind": "spawns"},
+    {"match": "PostTask", "kind": "handoff"},
+    {"match": "PostDelayedTask", "kind": "handoff"},
+    {"match": "SubmitTask", "kind": "handoff"},
+    {"match": "Schedule", "kind": "handoff"},
+    {"match": "schedule", "kind": "handoff"},
+    {"match": "ExecuteOn", "kind": "handoff"},
+    {"match": "RunOn", "kind": "handoff"},
+    {"match": "InvokeOn", "kind": "handoff"},
+    {"match": "thread_pool", "kind": "handoff"},
+    {"match": "ThreadPool", "kind": "handoff"},
+    {"match": "task_queue", "kind": "handoff"},
+    {"match": "Enqueue", "kind": "handoff"},
+    {"match": "enqueue", "kind": "handoff"}
+  ]
+}

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   end_line INTEGER NOT NULL,
   domain TEXT NOT NULL,
   backend TEXT NOT NULL,
-  signature TEXT NOT NULL DEFAULT ''
+  signature TEXT NOT NULL DEFAULT '',
+  namespace TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -61,6 +62,13 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # migrate older DBs
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+    if "namespace" not in cols:
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
+        )
+        conn.commit()
     return conn
 
 
