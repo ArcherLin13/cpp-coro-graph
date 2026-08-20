@@ -15,14 +15,12 @@ DOMAIN_COLOR = {
     "unknown": "#94a3b8",
 }
 
+# Four edge kinds only
 EDGE_COLOR = {
-    "await": "#ef4444",
-    "seq": "#f97316",
     "calls": "#38bdf8",
-    "device_call": "#f59e0b",
-    "handoff": "#a855f7",
-    "spawns": "#ec4899",
+    "await": "#ef4444",
     "contains": "#64748b",
+    "inherits": "#22c55e",
 }
 
 
@@ -31,7 +29,6 @@ def build_viz_payload(conn) -> dict:
     for r in conn.execute("SELECT * FROM nodes").fetchall():
         qname = r["qualified_name"] or r["name"]
         short = r["name"] or qname.split("::")[-1]
-        # file:foo.cpp → show basename only on canvas
         if r["kind"] == "file" and qname.startswith("file:"):
             short = qname.split("/")[-1].split("\\")[-1]
         nodes.append(
@@ -50,15 +47,22 @@ def build_viz_payload(conn) -> dict:
         )
     edges = []
     for r in conn.execute("SELECT * FROM edges").fetchall():
+        kind = r["kind"]
+        # map legacy kinds if old DB
+        if kind in ("seq",):
+            kind = "await"
+        elif kind in ("spawns", "handoff", "device_call"):
+            kind = "calls"
         edges.append(
             {
                 "from": r["source"],
                 "to": r["target"],
-                "label": r["kind"],
-                "kind": r["kind"],
+                "label": kind,
+                "kind": kind,
                 "file": r["file_path"],
                 "line": r["line"],
-                "color": EDGE_COLOR.get(r["kind"], "#94a3b8"),
+                "color": EDGE_COLOR.get(kind, "#94a3b8"),
+                "dashes": kind in ("await", "inherits"),
             }
         )
     return {"nodes": nodes, "edges": edges, "stats": store.stats(conn)}
@@ -90,26 +94,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <option>cpu</option><option>gpu</option><option>npu</option><option>dsp</option><option>unknown</option>
   </select>
   <select id="ekind">
+    <option value="control">calls + await</option>
     <option value="">all edges</option>
-    <option value="seq">seq (await order)</option>
-    <option value="await">await</option>
-    <option value="calls">calls</option>
-    <option value="handoff">handoff</option>
-    <option value="spawns">spawns</option>
-    <option value="device_call">device_call</option>
+    <option value="calls">calls (solid)</option>
+    <option value="await">await (dashed)</option>
     <option value="contains">contains (file)</option>
+    <option value="inherits">inherits</option>
   </select>
   <label class="chip"><input type="checkbox" id="hideUnresolved"/> hide unresolved</label>
   <label class="chip"><input type="checkbox" id="onlyLinked" checked/> only linked nodes</label>
-  <span class="chip"><span class="dot" style="background:#3b82f6"></span>cpu</span>
-  <span class="chip"><span class="dot" style="background:#22c55e"></span>gpu</span>
-  <span class="chip"><span class="dot" style="background:#f59e0b"></span>npu</span>
-  <span class="chip"><span class="dot" style="background:#f97316"></span>seq</span>
-  <span class="chip"><span class="dot" style="background:#ef4444"></span>await</span>
   <span class="chip"><span class="dot" style="background:#38bdf8"></span>calls</span>
+  <span class="chip"><span class="dot" style="background:#ef4444"></span>await</span>
   <span class="chip"><span class="dot" style="background:#64748b"></span>contains</span>
-  <span class="chip"><span class="dot" style="background:#a855f7"></span>handoff</span>
-  <span class="chip"><span class="dot" style="background:#ec4899"></span>spawns</span>
+  <span class="chip"><span class="dot" style="background:#22c55e"></span>inherits</span>
   <span id="meta"></span>
 </div>
 <div id="net"></div>
@@ -118,10 +115,16 @@ const DATA = __DATA__;
 const meta = document.getElementById('meta');
 meta.textContent = `files ${DATA.stats.files} · nodes ${DATA.stats.nodes} · edges ${DATA.stats.edges} · kinds ${JSON.stringify(DATA.stats.edge_kinds||{})}`;
 
+function edgeMatch(ekind, kind) {
+  if (!ekind) return true;
+  if (ekind === 'control') return kind === 'calls' || kind === 'await';
+  return kind === ekind;
+}
+
 function linkedIds(ekind) {
   const ids = new Set();
   for (const e of DATA.edges) {
-    if (ekind && e.kind !== ekind) continue;
+    if (!edgeMatch(ekind, e.kind)) continue;
     ids.add(e.from); ids.add(e.to);
   }
   return ids;
@@ -147,10 +150,11 @@ function render() {
   const nodes = visibleNodes();
   const ids = new Set(nodes.map(n => n.id));
   const ekind = document.getElementById('ekind').value;
-  const edges = DATA.edges.filter(e => ids.has(e.from) && ids.has(e.to) && (!ekind || e.kind === ekind));
+  const edges = DATA.edges.filter(e => ids.has(e.from) && ids.has(e.to) && edgeMatch(ekind, e.kind));
   const nset = new vis.DataSet(nodes.map(n => ({
     id: n.id,
     label: n.label,
+    shape: n.kind === 'class' ? 'box' : (n.kind === 'file' ? 'database' : 'ellipse'),
     color: { background: n.color, border: '#0f172a', highlight: { background: n.color, border: '#fff' } },
     font: { color: '#f8fafc', size: 13 },
     title: `${n.qname || n.label}\\n${n.kind} · ${n.domain}/${n.backend||'-'}\\n${n.file}:${n.line}`
@@ -158,6 +162,7 @@ function render() {
   const eset = new vis.DataSet(edges.map((e,i) => ({
     id: i, from: e.from, to: e.to, arrows: 'to',
     color: { color: e.color },
+    dashes: !!e.dashes,
     label: e.label,
     font: { color: '#cbd5e1', size: 10, strokeWidth: 0 },
     title: `${e.kind} @ ${e.file}:${e.line}`

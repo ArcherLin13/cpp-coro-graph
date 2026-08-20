@@ -39,11 +39,27 @@ def resolve_db(db_arg: str) -> Path:
     )
 
 
-def _parse_kinds(s: str) -> list[str] | None:
-    s = (s or "").strip()
-    if not s or s == "all":
-        return None
-    return [x.strip() for x in s.split(",") if x.strip()]
+def _parse_kinds(s: str, default: list[str] | None = None) -> list[str]:
+    from .query import ALL_EDGES, CONTROL_EDGES
+
+    default = list(default) if default is not None else list(CONTROL_EDGES)
+    s = (s or "").strip().lower()
+    if not s or s in {"control", "default"}:
+        return default
+    if s == "all":
+        return list(ALL_EDGES)
+    alias = {
+        "seq": "await",
+        "spawns": "calls",
+        "handoff": "calls",
+        "device_call": "calls",
+    }
+    out: list[str] = []
+    for p in s.split(","):
+        p = alias.get(p.strip(), p.strip())
+        if p and p not in out:
+            out.append(p)
+    return out or default
 
 
 def _print_nodes(nodes: list[dict], as_json: bool) -> None:
@@ -198,13 +214,15 @@ def cmd_callers(args: argparse.Namespace) -> int:
         )
         if len(matches) > 1:
             print(f"# note: {len(matches)} matches; using best hit", flush=True)
-    rows = Q.neighbors(
-        conn,
-        primary["id"],
-        direction="callers",
-        edge_kinds=_parse_kinds(args.edge_kind),
-        limit=args.limit,
-        hide_unresolved=not args.show_unresolved,
+    rows = Q.dedupe_neighbors(
+        Q.neighbors(
+            conn,
+            primary["id"],
+            direction="callers",
+            edge_kinds=_parse_kinds(args.edge_kind),
+            limit=args.limit,
+            hide_unresolved=not args.show_unresolved,
+        )
     )
     conn.close()
     if args.json:
@@ -239,13 +257,15 @@ def cmd_callees(args: argparse.Namespace) -> int:
             f"({primary['file_path']}:{primary['start_line']})",
             flush=True,
         )
-    rows = Q.neighbors(
-        conn,
-        primary["id"],
-        direction="callees",
-        edge_kinds=_parse_kinds(args.edge_kind),
-        limit=args.limit,
-        hide_unresolved=not args.show_unresolved,
+    rows = Q.dedupe_neighbors(
+        Q.neighbors(
+            conn,
+            primary["id"],
+            direction="callees",
+            edge_kinds=_parse_kinds(args.edge_kind),
+            limit=args.limit,
+            hide_unresolved=not args.show_unresolved,
+        )
     )
     conn.close()
     if args.json:
@@ -362,8 +382,8 @@ def _add_query_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--edge-kind",
         type=str,
-        default="all",
-        help="Filter edges: all | calls,await,seq,handoff,spawns,device_call,contains",
+        default="control",
+        help="Edge filter: control (=calls,await) | all | calls,await,contains,inherits",
     )
 
 

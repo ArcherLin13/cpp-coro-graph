@@ -108,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1.6-member-await")
-    store.upsert_meta(conn, "version", "0.3.4")
+    store.upsert_meta(conn, "mode", "syntax-v1.7-four-edges")
+    store.upsert_meta(conn, "version", "0.4.0")
 
     extracts: list[FileExtract] = []
     total = len(files)
@@ -234,8 +234,13 @@ def index_repo(
                     stub_ids.add(stub_id)
                     domain = e.domain if e.domain != "unknown" else "unknown"
                     backend = e.backend
-                    kind = "device_api" if e.kind == "device_call" else "unresolved"
+                    kind = "unresolved"
                     if e.kind == "device_call":
+                        kind = "device_api"
+                        domain = e.domain
+                    # folded device APIs arrive as calls with domain set
+                    if e.domain and e.domain != "unknown" and e.kind == "calls":
+                        kind = "device_api"
                         domain = e.domain
                     conn.execute(
                         "INSERT OR REPLACE INTO nodes"
@@ -294,7 +299,8 @@ def index_repo(
 
     log("promoting device domains ...")
     for row in conn.execute(
-        "SELECT source, domain FROM edges WHERE kind='device_call' AND domain!='unknown'"
+        "SELECT source, domain FROM edges "
+        "WHERE domain NOT IN ('', 'unknown') AND kind IN ('calls','await')"
     ).fetchall():
         conn.execute(
             "UPDATE nodes SET domain=?, backend=COALESCE(NULLIF(backend,''), ?) "

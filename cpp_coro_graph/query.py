@@ -5,9 +5,31 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+# Canonical edge model (v0.4+)
+CONTROL_EDGES = ["calls", "await"]
+STRUCT_EDGES = ["contains", "inherits"]
+ALL_EDGES = CONTROL_EDGES + STRUCT_EDGES
+
 
 def row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
     return {k: r[k] for k in r.keys()}
+
+
+def dedupe_neighbors(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per neighbor id; prefer await over calls."""
+    rank = {"await": 0, "calls": 1, "inherits": 2, "contains": 3}
+    best: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        nid = r["id"]
+        prev = best.get(nid)
+        if prev is None or rank.get(r.get("edge_kind"), 9) < rank.get(
+            prev.get("edge_kind"), 9
+        ):
+            best[nid] = r
+    return sorted(
+        best.values(),
+        key=lambda x: (x.get("edge_kind") or "", x.get("qualified_name") or ""),
+    )
 
 
 def find_nodes(
@@ -99,14 +121,7 @@ def explore(
     if not primary:
         return {"query": keyword, "match": None, "matches": [], "nodes": [], "edges": []}
 
-    edge_kinds = edge_kinds or [
-        "calls",
-        "await",
-        "seq",
-        "handoff",
-        "spawns",
-        "device_call",
-    ]
+    edge_kinds = edge_kinds or list(CONTROL_EDGES)
     seen = {primary["id"]}
     frontier = {primary["id"]}
     nodes = {primary["id"]: primary}
@@ -206,7 +221,7 @@ def impact(
                 conn,
                 nid,
                 direction="callers",
-                edge_kinds=["calls", "await", "handoff", "spawns"],
+                edge_kinds=list(CONTROL_EDGES),
                 limit=limit,
                 hide_unresolved=hide_unresolved,
             ):

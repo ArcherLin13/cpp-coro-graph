@@ -124,25 +124,22 @@ Edit `rules/devices.json` or pass `--rules your.json`:
 
 First match wins. Put longer / more specific strings first.
 
-## Edge kinds
+## Edge kinds (only four)
 
-Different questions → different edge types. Filter with `--edge-kind` / viz dropdown.
+| kind | viz | meaning |
+|------|-----|---------|
+| **`calls`** | solid | direct / sync call (incl. thread helpers) |
+| **`await`** | **dashed** | `co_await` / `CO_AWAIT` |
+| **`contains`** | gray | file owns function/class |
+| **`inherits`** | green dashed | `class Child : public Base` |
 
-| kind | layer | meaning | example |
-|------|-------|---------|---------|
-| `await` | control | coroutine suspends on target | `Caller --await--> A` |
-| **`seq`** | **order** | **same body, consecutive `co_await` order** | `A --seq--> DoCpuWork` (inside `Caller`) |
-| `calls` | control | normal / sync call | `Foo --calls--> Bar` |
-| `spawns` | schedule | starts work on another thread/task | `std::thread`, `co_spawn` |
-| `handoff` | schedule | posts/schedules to executor | `PostTask`, `asio::post` |
-| `device_call` | device | hit a device API pattern | `clEnqueue…` |
-| **`contains`** | **structure** | **file owns this function** | `file:demo.cpp --contains--> Caller` |
+`callers` / `callees` default to **control** = `calls`+`await` only (not file/inheritance), so the two directions stay distinct.
 
-- Want **顺序**：`--edge-kind seq`（或 `seq,await`）
-- Want **文件归属**：`--edge-kind contains`
-- Want **谁等谁**：`--edge-kind await`
-
-`seq` metadata `raw` records which coroutine (`in Caller #0`).
+```bash
+python3 -u -m cpp_coro_graph -q callees Call --db "$DB"           # await+calls
+python3 -u -m cpp_coro_graph -q callers Init --db "$DB"
+python3 -u -m cpp_coro_graph -q explore SosModel --edge-kind inherits,contains --db "$DB"
+```
 
 ## Skipped directories
 

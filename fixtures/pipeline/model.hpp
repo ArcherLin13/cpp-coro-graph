@@ -1,7 +1,8 @@
 #pragma once
+#include "base.hpp"
 namespace demo {
 
-struct SosModel {
+struct SosModel : public ModelBase {
   exec::task<void> Init();
   exec::task<void> Load();
   exec::task<void> PreRun();

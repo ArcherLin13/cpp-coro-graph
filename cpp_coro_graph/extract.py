@@ -935,8 +935,9 @@ def extract_file(
     for qn, lo, hi, _ns in bodies:
         locals_by_owner[qn] = _locals_in_body(clean[lo : hi + 1])
 
-    # Collect awaits in source order, then emit await + seq edges.
-    awaits: list[tuple[int, str, str, str, str]] = []  # idx, target, owner, domain, backend
+    # Collect awaits — only `await` edges (not also `calls`).
+    await_pairs: set[tuple[str, str]] = set()  # (owner, target) to suppress dup calls
+    awaits: list[tuple[int, str, str, str, str]] = []
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
         for m in rx.finditer(clean):
             idx = m.start()
@@ -966,6 +967,9 @@ def extract_file(
             if hit:
                 domain, backend = hit
             awaits.append((idx, target, owner, domain, backend))
+            await_pairs.add((owner, target))
+            # also suppress bare method name dup
+            await_pairs.add((owner, target.split('::')[-1]))
             out.edges.append(
                 RawEdge(
                     source_qname=owner,
@@ -980,32 +984,7 @@ def extract_file(
                 )
             )
 
-    # Sequential order: co_await A(); co_await B() => A -seq-> B (same owner)
-    awaits.sort(key=lambda t: t[0])
-    by_owner: dict[str, list[tuple[int, str, str, str]]] = {}
-    for idx, target, owner, domain, backend in awaits:
-        by_owner.setdefault(owner, []).append((idx, target, domain, backend))
-    for owner, items in by_owner.items():
-        for i in range(len(items) - 1):
-            _, prev_t, _, _ = items[i]
-            idx2, next_t, dom, back = items[i + 1]
-            if prev_t == next_t:
-                continue
-            out.edges.append(
-                RawEdge(
-                    source_qname=prev_t,  # resolved by indexer (not local owner)
-                    target_name=next_t,
-                    kind='seq',
-                    file_path=rel,
-                    line=line_of(clean, idx2),
-                    domain=dom,
-                    backend=back,
-                    raw_target=f'in {owner} #{i}',
-                    source_namespace=ns_of.get(owner, ''),
-                )
-            )
-
-    # Structural: file contains each defined function/coroutine
+    # Structural: file contains each defined function/coroutine / class
     if bodies:
         file_node = f'file:{rel}'
         if file_node not in seen_qnames:
@@ -1024,7 +1003,7 @@ def extract_file(
             out.edges.append(
                 RawEdge(
                     source_qname=file_node,
-                    target_name=qn,  # local exact qname — indexer maps locally first
+                    target_name=qn,
                     kind='contains',
                     file_path=rel,
                     line=line_of(clean, lo),
@@ -1032,6 +1011,9 @@ def extract_file(
                     source_namespace=ns,
                 )
             )
+
+    # Inheritance: Child -inherits-> Base (+ class nodes)
+    _extract_inherits(clean, rel, out, seen_qnames)
 
     for qn, lo, hi, ns in bodies:
         chunk = clean[lo : hi + 1]
@@ -1042,7 +1024,12 @@ def extract_file(
             if simple in _CALL_KEYWORDS or name in _CALL_KEYWORDS:
                 continue
             abs_idx = lo + m.start()
-            # Recover obj.method from match prefix when present
+            # Skip the call expression that sits inside co_await (already await edge)
+            window = clean[max(0, abs_idx - 24) : abs_idx]
+            if re.search(r'\bco_await\s+$', window) or re.search(
+                r'\b(?:CO_AWAIT|COAWAIT|CoAwait)\s*\(\s*$', window
+            ):
+                continue
             raw = m.group(0)
             member = re.match(
                 r'([A-Za-z_][\w:]*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(',
@@ -1060,19 +1047,22 @@ def extract_file(
                     owner_qname=qn,
                     locals_map=loc_map,
                 )
-            kind = classify_call_kind(target, thread_rules)
+            if (qn, target) in await_pairs or (qn, target.split('::')[-1]) in await_pairs:
+                continue
+            # Thread/device APIs still count as direct calls (one edge kind)
             out.edges.append(
                 RawEdge(
                     source_qname=qn,
                     target_name=target,
-                    kind=kind,
+                    kind='calls',
                     file_path=rel,
                     line=line_of(clean, abs_idx),
                     raw_target=raw[:80],
                     source_namespace=ns,
                 )
             )
-            if kind in {'spawns', 'handoff'}:
+            ck = classify_call_kind(target, thread_rules)
+            if ck in {'spawns', 'handoff'}:
                 rest = chunk[m.end() : m.end() + 120]
                 cm = re.match(r'\s*(?:&)?([A-Za-z_][\w:]*)', rest)
                 if cm:
@@ -1081,8 +1071,10 @@ def extract_file(
                         out.edges.append(
                             RawEdge(
                                 source_qname=qn,
-                                target_name=worker,
-                                kind='spawns',
+                                target_name=_qualify_member_target(
+                                    worker, owner_qname=qn, locals_map=loc_map
+                                ),
+                                kind='calls',
                                 file_path=rel,
                                 line=line_of(clean, abs_idx),
                                 raw_target=f'via {target} -> {worker}',
@@ -1090,6 +1082,7 @@ def extract_file(
                             )
                         )
 
+    # Device API hits: tag domain on owner; edge as plain calls to the API name
     if has_device:
         ranked = sorted(rules, key=lambda r: len(r.get('match') or ''), reverse=True)
         covered_ranges: list[tuple[int, int]] = []
@@ -1127,7 +1120,7 @@ def extract_file(
                     RawEdge(
                         source_qname=owner,
                         target_name=needle,
-                        kind='device_call',
+                        kind='calls',
                         file_path=rel,
                         line=line_of(clean, idx),
                         domain=rule.get('domain', 'unknown'),
@@ -1146,4 +1139,150 @@ def extract_file(
                 )
                 start = end
 
+    # Ensure every symbol node has file contains (decls without bodies too)
+    file_node = f"file:{rel}"
+    if any(n.kind in {"function", "coroutine", "declaration", "class"} for n in out.nodes):
+        if file_node not in seen_qnames:
+            seen_qnames.add(file_node)
+            out.nodes.append(
+                RawNode(
+                    name=Path(rel).name,
+                    qualified_name=file_node,
+                    kind="file",
+                    file_path=rel,
+                    start_line=1,
+                    end_line=1,
+                )
+            )
+        have = {
+            (e.source_qname, e.target_name)
+            for e in out.edges
+            if e.kind == "contains"
+        }
+        for n in list(out.nodes):
+            if n.kind not in {"function", "coroutine", "declaration", "class"}:
+                continue
+            key = (file_node, n.qualified_name)
+            if key in have:
+                continue
+            have.add(key)
+            out.edges.append(
+                RawEdge(
+                    source_qname=file_node,
+                    target_name=n.qualified_name,
+                    kind="contains",
+                    file_path=rel,
+                    line=n.start_line,
+                    raw_target=f"file contains {n.qualified_name}",
+                    source_namespace=n.namespace,
+                )
+            )
+
     return out
+
+
+_CLASS_HEAD = re.compile(
+    r"\b(?P<kw>class|struct)\s+(?P<name>[A-Za-z_]\w*)\b(?P<rest>[^;{]*)\{",
+    re.M,
+)
+
+
+def _extract_inherits(
+    clean: str,
+    rel: str,
+    out: FileExtract,
+    seen_qnames: set[str],
+) -> None:
+    """Emit class nodes + Child -inherits-> Base edges."""
+    ns_push, _ = _collect_brace_scopes(clean)
+    ns_events = sorted(ns_push.items())
+
+    def ns_at(pos: int) -> str:
+        stack: list[str] = []
+        for bpos, name in ns_events:
+            if bpos >= pos:
+                break
+            close = find_matching_brace(clean, bpos)
+            if close < 0 or close > pos:
+                stack.append(name)
+        return "::".join(x for x in stack if x)
+
+    for m in _CLASS_HEAD.finditer(clean):
+        name = m.group("name")
+        rest = m.group("rest") or ""
+        ns = ns_at(m.start())
+        qname = f"{ns}::{name}" if ns else name
+        if qname not in seen_qnames:
+            seen_qnames.add(qname)
+            out.nodes.append(
+                RawNode(
+                    name=name,
+                    qualified_name=qname,
+                    kind="class",
+                    file_path=rel,
+                    start_line=line_of(clean, m.start()),
+                    end_line=line_of(clean, m.start()),
+                    namespace=ns,
+                    signature=qname,
+                )
+            )
+        file_node = f"file:{rel}"
+        if file_node not in seen_qnames:
+            seen_qnames.add(file_node)
+            out.nodes.append(
+                RawNode(
+                    name=Path(rel).name,
+                    qualified_name=file_node,
+                    kind="file",
+                    file_path=rel,
+                    start_line=1,
+                    end_line=1,
+                )
+            )
+        out.edges.append(
+            RawEdge(
+                source_qname=file_node,
+                target_name=qname,
+                kind="contains",
+                file_path=rel,
+                line=line_of(clean, m.start()),
+                raw_target=f"file contains class {qname}",
+                source_namespace=ns,
+            )
+        )
+        if ":" not in rest:
+            continue
+        bases_part = rest.split(":", 1)[1]
+        for bm in re.finditer(
+            r"(?:public|protected|private|virtual)\s+([A-Za-z_][\w:]*)",
+            bases_part,
+        ):
+            base = bm.group(1)
+            if not base:
+                continue
+            base_q = base if "::" in base else (f"{ns}::{base}" if ns else base)
+            if base_q not in seen_qnames:
+                seen_qnames.add(base_q)
+                out.nodes.append(
+                    RawNode(
+                        name=base.split("::")[-1],
+                        qualified_name=base_q,
+                        kind="class",
+                        file_path=rel,
+                        start_line=line_of(clean, m.start()),
+                        end_line=line_of(clean, m.start()),
+                        namespace=ns if "::" not in base else "",
+                        signature=base_q,
+                    )
+                )
+            out.edges.append(
+                RawEdge(
+                    source_qname=qname,
+                    target_name=base_q,
+                    kind="inherits",
+                    file_path=rel,
+                    line=line_of(clean, m.start()),
+                    raw_target=f"{qname} : {base}",
+                    source_namespace=ns,
+                )
+            )
