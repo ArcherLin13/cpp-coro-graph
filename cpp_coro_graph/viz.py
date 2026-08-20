@@ -29,10 +29,16 @@ EDGE_COLOR = {
 def build_viz_payload(conn) -> dict:
     nodes = []
     for r in conn.execute("SELECT * FROM nodes").fetchall():
+        qname = r["qualified_name"] or r["name"]
+        short = r["name"] or qname.split("::")[-1]
+        # file:foo.cpp → show basename only on canvas
+        if r["kind"] == "file" and qname.startswith("file:"):
+            short = qname.split("/")[-1].split("\\")[-1]
         nodes.append(
             {
                 "id": r["id"],
-                "label": r["qualified_name"] or r["name"],
+                "label": short,
+                "qname": qname,
                 "name": r["name"],
                 "kind": r["kind"],
                 "domain": r["domain"],
@@ -132,7 +138,7 @@ function visibleNodes() {
     if (hideU && (n.kind === 'unresolved' || String(n.id).startsWith('unresolved:'))) return false;
     if (linked && !linked.has(n.id)) return false;
     if (domain && n.domain !== domain) return false;
-    if (q && !(`${n.label} ${n.file}`.toLowerCase().includes(q))) return false;
+    if (q && !(`${n.label} ${n.qname||''} ${n.file}`.toLowerCase().includes(q))) return false;
     return true;
   });
 }
@@ -144,10 +150,10 @@ function render() {
   const edges = DATA.edges.filter(e => ids.has(e.from) && ids.has(e.to) && (!ekind || e.kind === ekind));
   const nset = new vis.DataSet(nodes.map(n => ({
     id: n.id,
-    label: n.label.length > 40 ? n.label.slice(0,37)+'...' : n.label,
+    label: n.label,
     color: { background: n.color, border: '#0f172a', highlight: { background: n.color, border: '#fff' } },
-    font: { color: '#f8fafc', size: 12 },
-    title: `${n.label}\\n${n.kind} · ${n.domain}/${n.backend||'-'}\\n${n.file}:${n.line}`
+    font: { color: '#f8fafc', size: 13 },
+    title: `${n.qname || n.label}\\n${n.kind} · ${n.domain}/${n.backend||'-'}\\n${n.file}:${n.line}`
   })));
   const eset = new vis.DataSet(edges.map((e,i) => ({
     id: i, from: e.from, to: e.to, arrows: 'to',
