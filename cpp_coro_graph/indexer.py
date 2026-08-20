@@ -14,9 +14,11 @@ SKIP_DIRS = {
     ".svn",
     ".hg",
     ".codegraph",
+    ".cpp-coro-graph",
     "node_modules",
     "build",
     "out",
+    "output",
     "dist",
     "target",
     ".venv",
@@ -26,14 +28,22 @@ SKIP_DIRS = {
     "thirdparty",
     "ThirdParty",
     "external",
+    "prebuilts",
+    "out_dir",
     ".idea",
     ".vs",
+    ".repo",
     "CMakeFiles",
 }
 
 
 def should_skip_dir(name: str) -> bool:
-    return name in SKIP_DIRS or name.startswith(".")
+    if name in SKIP_DIRS or name.startswith("."):
+        return True
+    # Linux / Android / Bazel style generated trees
+    if name.startswith("bazel-") or name.startswith("cmake-build"):
+        return True
+    return False
 
 
 def iter_cpp_files(root: Path) -> list[Path]:
