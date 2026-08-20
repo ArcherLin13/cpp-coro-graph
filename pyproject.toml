@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpp-coro-graph"
+version = "0.1.0"
+description = "C++17 coroutine + device-domain syntax graph (Linux-first)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ArcherLin13" }]
+keywords = ["c++", "coroutine", "co_await", "graph", "npu", "gpu"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Code Generators",
+]
+dependencies = []
+
+[project.scripts]
+cpp-coro-graph = "cpp_coro_graph.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ArcherLin13/cpp-coro-graph"
+Repository = "https://github.com/ArcherLin13/cpp-coro-graph"
+
+[tool.setuptools.packages.find]
+include = ["cpp_coro_graph*"]
+
+[tool.setuptools.package-data]
+"cpp_coro_graph" = ["rules/*.json"]

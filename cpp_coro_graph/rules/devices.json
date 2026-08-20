@@ -1,0 +1,23 @@
+{
+  "comment": "Match against call / identifier text (case-sensitive unless noted). First match wins.",
+  "patterns": [
+    {"match": "clEnqueueNDRangeKernel", "domain": "gpu", "backend": "opencl"},
+    {"match": "clEnqueue", "domain": "gpu", "backend": "opencl"},
+    {"match": "cl::CommandQueue", "domain": "gpu", "backend": "opencl"},
+    {"match": "cudaLaunchKernel", "domain": "gpu", "backend": "cuda"},
+    {"match": "cudaMemcpy", "domain": "gpu", "backend": "cuda"},
+    {"match": "<<<", "domain": "gpu", "backend": "cuda"},
+    {"match": "vkCmdDispatch", "domain": "gpu", "backend": "vulkan"},
+    {"match": "vkQueueSubmit", "domain": "gpu", "backend": "vulkan"},
+    {"match": "RunOnNpu", "domain": "npu", "backend": "custom"},
+    {"match": "NpuSubmit", "domain": "npu", "backend": "custom"},
+    {"match": "SubmitToNpu", "domain": "npu", "backend": "custom"},
+    {"match": "AclmdlExecute", "domain": "npu", "backend": "ascend"},
+    {"match": "aclrt", "domain": "npu", "backend": "ascend"},
+    {"match": "hiainn", "domain": "npu", "backend": "custom"},
+    {"match": "OH_NN", "domain": "npu", "backend": "nnrt"},
+    {"match": "NNRt", "domain": "npu", "backend": "nnrt"},
+    {"match": "dsp_", "domain": "dsp", "backend": "custom"},
+    {"match": "RunOnDsp", "domain": "dsp", "backend": "custom"}
+  ]
+}

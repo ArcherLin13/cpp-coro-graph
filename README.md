@@ -1,7 +1,7 @@
 # cpp-coro-graph (V1)
 
-Syntax-level **C++17 coroutine + device-domain** graph for **Linux C/C++ trees**.  
-**No `compile_commands.json`.** Stdlib-only Python 3.
+Syntax-level **C++17 coroutine + device-domain** graph.  
+**Primary target: Linux.** Stdlib-only Python 3.9+ (no pip deps required to run).
 
 What V1 can do:
 
@@ -16,55 +16,50 @@ What V1 cannot do:
 - Cross-thread resume / true parallel edges from time
 - Perfect C++ parsing (regex + brace matching, not a compiler)
 
-## Requirements
-
-- Linux (or WSL2 with the repo **inside the Linux filesystem**, not `/mnt/c/...`)
-- Python 3.9+ (`python3`)
-
-Run the indexer **on the same machine/OS that holds the source tree**. Indexing a Linux checkout through a Windows path mount is slow and error-prone.
-
-## Quick start (Linux)
+## Install on Linux
 
 ```bash
-# clone this tool
 git clone https://github.com/ArcherLin13/cpp-coro-graph.git
 cd cpp-coro-graph
 
-# index your Linux code repo
-python3 -m cpp_coro_graph index /path/to/your/linux/repo
+# option A — no install (recommended for a quick try)
+chmod +x scripts/cpp-coro-graph scripts/index_repo.sh
+./scripts/cpp-coro-graph index /path/to/your/repo
 
-# HTML graph
-python3 -m cpp_coro_graph viz --db /path/to/your/linux/repo/.cpp-coro-graph/graph.db
-# open: /path/to/your/linux/repo/.cpp-coro-graph/graph.html
+# option B — install CLI on PATH
+python3 -m pip install -e .
+cpp-coro-graph index /path/to/your/repo
 ```
 
-Or:
+Requires only `python3` (3.9+). Uses the stdlib `sqlite3` module.
+
+## Index your Linux code tree
 
 ```bash
-chmod +x scripts/index_repo.sh
+# one-shot: index + HTML + status
 ./scripts/index_repo.sh /path/to/your/linux/repo
+
+# or step by step
+python3 -m cpp_coro_graph index /path/to/your/linux/repo
+python3 -m cpp_coro_graph viz --db /path/to/your/linux/repo/.cpp-coro-graph/graph.db
+python3 -m cpp_coro_graph status --db /path/to/your/linux/repo/.cpp-coro-graph/graph.db
 ```
 
-Default DB: `<repo>/.cpp-coro-graph/graph.db`  
-Default HTML: `<repo>/.cpp-coro-graph/graph.html`
+Outputs:
 
-Useful:
+- `/path/to/your/linux/repo/.cpp-coro-graph/graph.db`
+- `/path/to/your/linux/repo/.cpp-coro-graph/graph.html` (open in a browser)
 
-```bash
-python3 -m cpp_coro_graph status --db /path/to/repo/.cpp-coro-graph/graph.db
-python3 -m cpp_coro_graph export --db /path/to/repo/.cpp-coro-graph/graph.db
-```
+Run the tool **on the Linux machine (or WSL2 Linux filesystem)** that holds the sources. Avoid indexing via `/mnt/c/...` from WSL.
 
 Smoke test:
 
 ```bash
-python3 -m cpp_coro_graph index fixtures/sample --db fixtures/sample/.cpp-coro-graph/graph.db
-python3 -m cpp_coro_graph viz --db fixtures/sample/.cpp-coro-graph/graph.db
+./scripts/cpp-coro-graph index fixtures/sample --db fixtures/sample/.cpp-coro-graph/graph.db
+./scripts/cpp-coro-graph viz --db fixtures/sample/.cpp-coro-graph/graph.db
 ```
 
 ## Cursor MCP (optional)
-
-Index on Linux first, then point MCP at that DB (paths must be reachable from the Cursor host — e.g. WSL or remote SSH):
 
 ```json
 {
@@ -109,4 +104,4 @@ Node colors in HTML = domain. Red edges = await.
 
 ## Skipped directories
 
-`.git`, `build`, `out`, `third_party`, `node_modules`, `.codegraph`, `bazel-*`, `.repo`, `output`, …
+`.git`, `build`, `out`, `third_party`, `node_modules`, `.codegraph`, `bazel-*`, `.repo`, `prebuilts`, …

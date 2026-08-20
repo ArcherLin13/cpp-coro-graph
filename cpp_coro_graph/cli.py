@@ -101,11 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    raise SystemExit(int(args.func(args)))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

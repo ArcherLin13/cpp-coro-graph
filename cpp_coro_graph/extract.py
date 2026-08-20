@@ -107,7 +107,19 @@ def line_of(text: str, index: int) -> int:
 
 def load_device_rules(path: Path | None) -> list[dict[str, str]]:
     if path is None:
-        path = Path(__file__).resolve().parent.parent / "rules" / "devices.json"
+        # Prefer packaged rules (works after pip install), then repo-level rules/
+        candidates = [
+            Path(__file__).resolve().parent / "rules" / "devices.json",
+            Path(__file__).resolve().parent.parent / "rules" / "devices.json",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                path = candidate
+                break
+        else:
+            raise FileNotFoundError(
+                "devices.json not found; pass --rules or install package data"
+            )
     data = json.loads(path.read_text(encoding="utf-8"))
     return list(data.get("patterns") or [])
 
