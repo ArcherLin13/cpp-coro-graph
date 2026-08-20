@@ -7,10 +7,11 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, store
-from .indexer import index_repo, log
-from .viz import write_html
-from .mcp_server import serve
+from . import __version__
+
+
+def log(msg: str) -> None:
+    print(f"[cpp-coro-graph] {msg}", file=sys.stderr, flush=True)
 
 
 def _default_db(root: Path) -> Path:
@@ -18,6 +19,8 @@ def _default_db(root: Path) -> Path:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    from .indexer import index_repo
+
     root = Path(args.path).resolve()
     log(f"command=index path={args.path} -> {root}")
     if not root.is_dir():
@@ -34,6 +37,9 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 def cmd_viz(args: argparse.Namespace) -> int:
+    from . import store
+    from .viz import write_html
+
     db = Path(args.db).resolve()
     log(f"command=viz db={db}")
     if not db.is_file():
@@ -47,6 +53,8 @@ def cmd_viz(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
+    from . import store
+
     db = Path(args.db).resolve()
     log(f"command=export db={db}")
     if not db.is_file():
@@ -63,6 +71,8 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    from . import store
+
     db = Path(args.db).resolve()
     log(f"command=status db={db}")
     if not db.is_file():
@@ -75,6 +85,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp_server import serve
+
     db = Path(args.db).resolve()
     log(f"command=mcp db={db} (waiting on stdin JSON-RPC)")
     if not db.is_file():
@@ -125,7 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     print(
-        f"[cpp-coro-graph] starting v{__version__}  argv={argv if argv is not None else sys.argv[1:]}",
+        f"[cpp-coro-graph] starting v{__version__}  "
+        f"argv={argv if argv is not None else sys.argv[1:]}",
         file=sys.stderr,
         flush=True,
     )

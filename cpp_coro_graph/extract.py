@@ -1,4 +1,7 @@
-"""Syntax-level C++ extraction: functions, co_await edges, device tags."""
+"""Syntax-level C++ extraction: functions, co_await edges, device tags.
+
+V1.1: avoid catastrophic regexes on large headers (was hanging on cppcoro).
+"""
 
 from __future__ import annotations
 
@@ -8,50 +11,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Strip // and /* */ comments (naive; good enough for V1 probes).
-_COMMENT_LINE = re.compile(r"//.*?$", re.M)
-_COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.S)
-_STRING = re.compile(
-    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
-)
+# Skip / light-parse very large headers (regex body matching is O(n^2) risk).
+MAX_FULL_PARSE_BYTES = 256 * 1024
 
-# co_await Foo( / co_await Foo::Bar( / co_await x.foo( / co_await ptr->foo(
+_COMMENT_LINE = re.compile(r"//.*?$", re.M)
+_COMMENT_BLOCK = re.compile(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/")  # non-backtracking-ish
+_STRING = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
 _CO_AWAIT = re.compile(
     r"\bco_await\s+"
-    r"(?P<target>"
-    r"(?:"
-    r"[A-Za-z_][\w:]*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*"  # id / a.b / a->b
-    r"|[A-Za-z_][\w:]*"
-    r")"
-    r")"
-    r"(?P<call>\s*\()?",
+    r"(?P<target>[A-Za-z_][\w:]*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)"
+    r"(?:\s*\()?",
     re.M,
 )
 
-# Return-type style: exec::task<void> Name(  or task<T> Name(
+# Bounded template args — no nested craziness
 _TASK_FN = re.compile(
-    r"(?P<ret>(?:[\w:]+::)*task\s*<[^;{}]{0,200}?>)\s+"
+    r"(?P<ret>(?:[\w:]+::)*task\s*<[^;{}]{0,120}?>)\s+"
     r"(?P<name>[A-Za-z_]\w*)\s*\(",
     re.M,
 )
 
-# Method: Ret Class::Name(  — only when body later has co_await we mark coroutine
-_METHOD = re.compile(
-    r"(?P<ret>[\w:<>,\s*&]+?)\s+"
-    r"(?P<cls>[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::"
-    r"(?P<name>[A-Za-z_]\w*|operator\s*\(\))\s*\(",
+# Lightweight: name(...) {  only on same / nearby lines when file has co_await
+_SIMPLE_FN = re.compile(
+    r"(?P<qname>(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\([^;{}]{0,200}\)\s*"
+    r"(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?\{",
     re.M,
 )
 
-# Free function rough: type Name( at column-ish start
-_FREE_FN = re.compile(
-    r"(?:^|\n)\s*(?:(?:inline|static|constexpr|virtual|explicit|friend)\s+)*"
-    r"(?P<ret>(?:[\w:]+::)*[\w]+(?:\s*<[^;{}]*>)?(?:\s*[*&]+)?)\s+"
-    r"(?P<name>[A-Za-z_]\w*)\s*\([^;]*?\)\s*(?:const\s*)?(?:override\s*)?\{",
-    re.M,
-)
-
-_CO_RETURN = re.compile(r"\bco_return\b|\bco_yield\b|\bco_await\b")
+_HAS_CORO_KW = re.compile(r"\b(?:co_await|co_return|co_yield)\b")
 
 CPP_EXTS = {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h", ".cuh", ".cu", ".inl", ".ipp"}
 
@@ -60,20 +48,22 @@ CPP_EXTS = {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h", ".cuh", ".cu", ".inl", "
 class RawNode:
     name: str
     qualified_name: str
-    kind: str  # function | coroutine | call_site
+    kind: str
     file_path: str
     start_line: int
     end_line: int
     domain: str = "cpu"
     backend: str = "host"
     signature: str = ""
+    body_lo: int = -1
+    body_hi: int = -1
 
 
 @dataclass
 class RawEdge:
     source_qname: str
-    target_name: str  # unresolved name; indexer resolves
-    kind: str  # await | calls | device_call
+    target_name: str
+    kind: str
     file_path: str
     line: int
     domain: str = "unknown"
@@ -87,11 +77,10 @@ class FileExtract:
     nodes: list[RawNode] = field(default_factory=list)
     edges: list[RawEdge] = field(default_factory=list)
     device_hits: list[dict[str, Any]] = field(default_factory=list)
+    skipped: str = ""
 
 
 def strip_noise(src: str) -> str:
-    """Remove strings/comments so regexes don't false-hit inside them."""
-
     def _sp(m: re.Match[str]) -> str:
         return " " * (m.end() - m.start())
 
@@ -107,7 +96,6 @@ def line_of(text: str, index: int) -> int:
 
 def load_device_rules(path: Path | None) -> list[dict[str, str]]:
     if path is None:
-        # Prefer packaged rules (works after pip install), then repo-level rules/
         candidates = [
             Path(__file__).resolve().parent / "rules" / "devices.json",
             Path(__file__).resolve().parent.parent / "rules" / "devices.json",
@@ -132,11 +120,10 @@ def match_device(text: str, rules: list[dict[str, str]]) -> tuple[str, str] | No
     return None
 
 
-def find_matching_brace(text: str, open_idx: int) -> int:
-    """open_idx points at '{'. Return index of matching '}' or -1."""
+def find_matching_brace(text: str, open_idx: int, max_scan: int = 2_000_000) -> int:
     depth = 0
     i = open_idx
-    n = len(text)
+    n = min(len(text), open_idx + max_scan)
     while i < n:
         c = text[i]
         if c == "{":
@@ -150,11 +137,12 @@ def find_matching_brace(text: str, open_idx: int) -> int:
 
 
 def _body_after_paren(text: str, paren_open: int) -> tuple[int, int] | None:
-    """From '(' of a function decl, find '{'..'}' body range indices."""
     i = paren_open
     depth = 0
     n = len(text)
-    while i < n:
+    # Cap how far we scan for the closing ')' of the parameter list
+    limit = min(n, paren_open + 8000)
+    while i < limit:
         c = text[i]
         if c == "(":
             depth += 1
@@ -164,8 +152,9 @@ def _body_after_paren(text: str, paren_open: int) -> tuple[int, int] | None:
                 j = i + 1
                 while j < n and text[j] in " \t\r\n":
                     j += 1
-                # skip trailing qualifiers
-                while True:
+                steps = 0
+                while steps < 20:
+                    steps += 1
                     if text.startswith("const", j):
                         j += 5
                     elif text.startswith("override", j):
@@ -176,7 +165,7 @@ def _body_after_paren(text: str, paren_open: int) -> tuple[int, int] | None:
                         j += 8
                         if j < n and text[j] == "(":
                             d = 0
-                            while j < n:
+                            while j < n and j < i + 9000:
                                 if text[j] == "(":
                                     d += 1
                                 elif text[j] == ")":
@@ -190,6 +179,8 @@ def _body_after_paren(text: str, paren_open: int) -> tuple[int, int] | None:
                         j += 2
                         while j < n and text[j] not in "{;":
                             j += 1
+                            if j - i > 9000:
+                                break
                         continue
                     else:
                         break
@@ -205,22 +196,111 @@ def _body_after_paren(text: str, paren_open: int) -> tuple[int, int] | None:
 
 
 def _normalize_await_target(raw: str) -> str:
-    raw = re.sub(r"\s+", "", raw)
-    # a->b / a.b → keep last segment as primary call name hint, keep full as qname-ish
-    return raw
+    return re.sub(r"\s+", "", raw)
+
+
+def _add_coro_node(
+    out: FileExtract,
+    seen: set[str],
+    *,
+    name: str,
+    qname: str,
+    rel: str,
+    start_line: int,
+    end_line: int,
+    domain: str,
+    backend: str,
+    signature: str,
+    body_lo: int,
+    body_hi: int,
+) -> str:
+    if qname in seen:
+        qname = f"{rel}::{name}@{start_line}"
+    seen.add(qname)
+    out.nodes.append(
+        RawNode(
+            name=name,
+            qualified_name=qname,
+            kind="coroutine",
+            file_path=rel,
+            start_line=start_line,
+            end_line=end_line,
+            domain=domain,
+            backend=backend,
+            signature=signature,
+            body_lo=body_lo,
+            body_hi=body_hi,
+        )
+    )
+    return qname
 
 
 def extract_file(path: Path, rel: str, rules: list[dict[str, str]]) -> FileExtract:
+    out = FileExtract(path=rel)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        out.skipped = "stat-failed"
+        return out
+
+    if size > MAX_FULL_PARSE_BYTES:
+        # Still do a cheap co_await scan on raw text (no strip / no body match)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            out.skipped = "read-failed"
+            return out
+        out.skipped = f"too-large:{size}"
+        if "co_await" not in text and "task<" not in text:
+            return out
+        file_node = f"file:{rel}"
+        out.nodes.append(
+            RawNode(
+                name=Path(rel).name,
+                qualified_name=file_node,
+                kind="function",
+                file_path=rel,
+                start_line=1,
+                end_line=1,
+                domain="cpu",
+                backend="host",
+            )
+        )
+        for m in _CO_AWAIT.finditer(text):
+            out.edges.append(
+                RawEdge(
+                    source_qname=file_node,
+                    target_name=_normalize_await_target(m.group("target")),
+                    kind="await",
+                    file_path=rel,
+                    line=line_of(text, m.start()),
+                    raw_target=m.group(0)[:80],
+                )
+            )
+        return out
+
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return FileExtract(path=rel)
+        out.skipped = "read-failed"
+        return out
+
+    # Fast reject: nothing interesting
+    interesting = (
+        "co_await" in text
+        or "co_return" in text
+        or "co_yield" in text
+        or "task<" in text
+        or any((r.get("match") or "") in text for r in rules)
+    )
+    if not interesting:
+        return out
 
     clean = strip_noise(text)
-    out = FileExtract(path=rel)
-    seen_qnames: set[str] = set()
+    seen: set[str] = set()
+    bodies: list[tuple[str, int, int]] = []  # qname, lo, hi
 
-    # Device hits anywhere in file (for tagging + edges from nearest function)
+    # Device hits (file-level bookkeeping)
     for rule in rules:
         needle = rule["match"]
         start = 0
@@ -238,195 +318,174 @@ def extract_file(path: Path, rel: str, rules: list[dict[str, str]]) -> FileExtra
             )
             start = idx + max(1, len(needle))
 
-    # task<...> Name( → coroutine definitions (must have a body)
+    # task<...> Name( { ... }
     for m in _TASK_FN.finditer(clean):
         name = m.group("name")
-        paren = m.end() - 1  # at '('
-        if clean[paren] != "(":
-            paren = clean.find("(", m.start())
-        body = _body_after_paren(clean, paren) if paren >= 0 else None
-        if not body:
-            continue  # declaration only — skip in V1
-        start_line = line_of(clean, m.start())
-        end_line = line_of(clean, body[1])
-        qname = name
-        if qname in seen_qnames:
-            qname = f"{rel}::{name}@{start_line}"
-        seen_qnames.add(qname)
-        domain, backend = "cpu", "host"
-        body_txt = clean[body[0] : body[1] + 1]
-        hit = match_device(body_txt, rules)
-        if hit:
-            domain, backend = hit
-        # Name itself is a device API (e.g. RunOnNpu)
-        hit2 = match_device(name, rules)
-        if hit2:
-            domain, backend = hit2
-        out.nodes.append(
-            RawNode(
-                name=name,
-                qualified_name=qname,
-                kind="coroutine",
-                file_path=rel,
-                start_line=start_line,
-                end_line=end_line,
-                domain=domain,
-                backend=backend,
-                signature=m.group("ret").strip() + " " + name,
-            )
-        )
-        _extract_awaits_in_body(
-            out, clean, body[0], body[1], qname, rel, rules
-        )
-        _extract_device_calls_in_body(
-            out, clean, body[0], body[1], qname, rel, rules
-        )
-
-    # Free / method functions whose body contains co_await
-    for rx in (_FREE_FN,):
-        for m in rx.finditer(clean):
-            name = m.group("name")
-            if name in {"if", "for", "while", "switch", "catch", "return"}:
-                continue
-            # find '(' of this match — last ( before {
-            brace = clean.find("{", m.start())
-            if brace < 0:
-                continue
-            paren = clean.rfind("(", m.start(), brace)
-            if paren < 0:
-                continue
-            body = _body_after_paren(clean, paren)
-            if not body:
-                continue
-            body_txt = clean[body[0] : body[1] + 1]
-            if not _CO_RETURN.search(body_txt):
-                continue
-            start_line = line_of(clean, m.start())
-            end_line = line_of(clean, body[1])
-            qname = name
-            if qname in seen_qnames:
-                continue  # already from task<> pattern
-            seen_qnames.add(qname)
-            domain, backend = "cpu", "host"
-            hit = match_device(body_txt, rules)
-            if hit:
-                domain, backend = hit
-            out.nodes.append(
-                RawNode(
-                    name=name,
-                    qualified_name=qname,
-                    kind="coroutine",
-                    file_path=rel,
-                    start_line=start_line,
-                    end_line=end_line,
-                    domain=domain,
-                    backend=backend,
-                    signature=(m.group("ret") or "").strip() + " " + name,
-                )
-            )
-            _extract_awaits_in_body(
-                out, clean, body[0], body[1], qname, rel, rules
-            )
-            _extract_device_calls_in_body(
-                out, clean, body[0], body[1], qname, rel, rules
-            )
-
-    # Class::Method with co_await in body
-    for m in _METHOD.finditer(clean):
-        cls = m.group("cls")
-        name = m.group("name").replace(" ", "")
         paren = m.end() - 1
-        if clean[paren] != "(":
-            paren = clean.find("(", m.start())
-        body = _body_after_paren(clean, paren) if paren >= 0 else None
-        if not body:
-            continue
-        body_txt = clean[body[0] : body[1] + 1]
-        is_coro = bool(_CO_RETURN.search(body_txt))
-        is_task_ret = "task<" in (m.group("ret") or "").replace(" ", "")
-        if not (is_coro or is_task_ret):
-            continue
-        start_line = line_of(clean, m.start())
-        end_line = line_of(clean, body[1])
-        qname = f"{cls}::{name}"
-        if qname in seen_qnames:
-            continue
-        seen_qnames.add(qname)
-        domain, backend = "cpu", "host"
-        hit = match_device(body_txt, rules)
-        if hit:
-            domain, backend = hit
-        out.nodes.append(
-            RawNode(
-                name=name,
-                qualified_name=qname,
-                kind="coroutine" if (is_coro or is_task_ret) else "function",
-                file_path=rel,
-                start_line=start_line,
-                end_line=end_line,
-                domain=domain,
-                backend=backend,
-                signature=f"{(m.group('ret') or '').strip()} {qname}",
-            )
-        )
-        _extract_awaits_in_body(out, clean, body[0], body[1], qname, rel, rules)
-        _extract_device_calls_in_body(
-            out, clean, body[0], body[1], qname, rel, rules
-        )
-
-    # Non-coroutine functions that still call device APIs (host glue)
-    for m in _FREE_FN.finditer(clean):
-        name = m.group("name")
-        if name in {"if", "for", "while", "switch", "catch", "return"}:
-            continue
-        brace = clean.find("{", m.start())
-        if brace < 0:
-            continue
-        paren = clean.rfind("(", m.start(), brace)
+        if paren < 0 or clean[paren] != "(":
+            paren = clean.find("(", m.start(), m.start() + 200)
         if paren < 0:
             continue
         body = _body_after_paren(clean, paren)
         if not body:
             continue
         body_txt = clean[body[0] : body[1] + 1]
-        hit = match_device(body_txt, rules)
-        if not hit:
-            continue
-        if name in seen_qnames or any(
-            n.qualified_name == name for n in out.nodes
-        ):
-            continue
-        start_line = line_of(clean, m.start())
-        end_line = line_of(clean, body[1])
-        domain, backend = hit
-        seen_qnames.add(name)
-        out.nodes.append(
-            RawNode(
+        domain, backend = "cpu", "host"
+        hit = match_device(body_txt, rules) or match_device(name, rules)
+        if hit:
+            domain, backend = hit
+        qname = _add_coro_node(
+            out,
+            seen,
+            name=name,
+            qname=name,
+            rel=rel,
+            start_line=line_of(clean, m.start()),
+            end_line=line_of(clean, body[1]),
+            domain=domain,
+            backend=backend,
+            signature=m.group("ret").strip() + " " + name,
+            body_lo=body[0],
+            body_hi=body[1],
+        )
+        bodies.append((qname, body[0], body[1]))
+
+    # If file uses co_await but we found no task<> defs, pick simple Name(...){ that
+    # actually contain co_await (capped matches to avoid blow-ups).
+    if _HAS_CORO_KW.search(clean) and not bodies:
+        count = 0
+        for m in _SIMPLE_FN.finditer(clean):
+            count += 1
+            if count > 400:
+                break
+            qname = m.group("qname")
+            name = qname.split("::")[-1]
+            if name in {"if", "for", "while", "switch", "catch"}:
+                continue
+            brace = m.end() - 1
+            if clean[brace] != "{":
+                continue
+            end = find_matching_brace(clean, brace)
+            if end < 0:
+                continue
+            body_txt = clean[brace : end + 1]
+            if not _HAS_CORO_KW.search(body_txt):
+                continue
+            domain, backend = "cpu", "host"
+            hit = match_device(body_txt, rules)
+            if hit:
+                domain, backend = hit
+            qn = _add_coro_node(
+                out,
+                seen,
                 name=name,
-                qualified_name=name,
-                kind="function",
-                file_path=rel,
-                start_line=start_line,
-                end_line=end_line,
+                qname=qname,
+                rel=rel,
+                start_line=line_of(clean, m.start()),
+                end_line=line_of(clean, end),
                 domain=domain,
                 backend=backend,
-                signature=(m.group("ret") or "").strip() + " " + name,
+                signature=qname,
+                body_lo=brace,
+                body_hi=end,
+            )
+            bodies.append((qn, brace, end))
+
+    # Assign each co_await to innermost containing body
+    for m in _CO_AWAIT.finditer(clean):
+        abs_idx = m.start()
+        line = line_of(clean, abs_idx)
+        target = _normalize_await_target(m.group("target"))
+        domain, backend = "unknown", ""
+        hit = match_device(target, rules) or match_device(m.group(0), rules)
+        if hit:
+            domain, backend = hit
+        owner = None
+        best_span = None
+        for qname, lo, hi in bodies:
+            if lo <= abs_idx <= hi:
+                span = hi - lo
+                if best_span is None or span < best_span:
+                    best_span = span
+                    owner = qname
+        if owner is None:
+            file_node = f"file:{rel}"
+            if file_node not in seen:
+                seen.add(file_node)
+                out.nodes.append(
+                    RawNode(
+                        name=Path(rel).name,
+                        qualified_name=file_node,
+                        kind="function",
+                        file_path=rel,
+                        start_line=1,
+                        end_line=line_of(clean, max(0, len(clean) - 1)),
+                        domain="cpu",
+                        backend="host",
+                    )
+                )
+            owner = file_node
+        out.edges.append(
+            RawEdge(
+                source_qname=owner,
+                target_name=target,
+                kind="await",
+                file_path=rel,
+                line=line,
+                domain=domain,
+                backend=backend,
+                raw_target=m.group(0)[:120],
             )
         )
-        _extract_device_calls_in_body(
-            out, clean, body[0], body[1], name, rel, rules
-        )
 
-    # File-level co_await not inside a detected function → synthetic node
-    for m in _CO_AWAIT.finditer(clean):
-        line = line_of(clean, m.start())
-        # skip if already captured as edge on same line from some function
-        if any(e.line == line and e.kind == "await" for e in out.edges):
-            continue
-        # orphan: attach to file scope
+    # Device API calls inside known bodies (longest-match, skip if already awaited)
+    ranked = sorted(rules, key=lambda r: len(r.get("match") or ""), reverse=True)
+    for qname, lo, hi in bodies:
+        chunk = clean[lo : hi + 1]
+        await_targets = {
+            e.target_name.split("::")[-1]
+            for e in out.edges
+            if e.source_qname == qname and e.kind == "await"
+        }
+        covered: list[tuple[int, int]] = []
+        for rule in ranked:
+            needle = rule["match"]
+            start = 0
+            while True:
+                idx = chunk.find(needle, start)
+                if idx < 0:
+                    break
+                end = idx + len(needle)
+                if any(not (end <= a or idx >= b) for a, b in covered):
+                    start = idx + 1
+                    continue
+                if any(needle in t or t in needle for t in await_targets):
+                    start = end
+                    continue
+                covered.append((idx, end))
+                out.edges.append(
+                    RawEdge(
+                        source_qname=qname,
+                        target_name=needle,
+                        kind="device_call",
+                        file_path=rel,
+                        line=line_of(clean, lo + idx),
+                        domain=rule.get("domain", "unknown"),
+                        backend=rule.get("backend", ""),
+                        raw_target=needle,
+                    )
+                )
+                start = end
+
+        # Non-coro host glue: if body has device API but node was coroutine-only path
+        # already handled above.
+
+    # Host functions that are not coroutines but call device APIs
+    if out.device_hits and not any(e.kind == "device_call" for e in out.edges):
+        # attach device hits to a synthetic file node
         file_node = f"file:{rel}"
-        if file_node not in seen_qnames:
-            seen_qnames.add(file_node)
+        if file_node not in seen:
+            seen.add(file_node)
             out.nodes.append(
                 RawNode(
                     name=Path(rel).name,
@@ -434,104 +493,29 @@ def extract_file(path: Path, rel: str, rules: list[dict[str, str]]) -> FileExtra
                     kind="function",
                     file_path=rel,
                     start_line=1,
-                    end_line=line_of(clean, len(clean) - 1) if clean else 1,
-                    domain="cpu",
-                    backend="host",
+                    end_line=1,
+                    domain=out.device_hits[0]["domain"],
+                    backend=out.device_hits[0].get("backend", ""),
                 )
             )
-        target = _normalize_await_target(m.group("target"))
-        out.edges.append(
-            RawEdge(
-                source_qname=file_node,
-                target_name=target,
-                kind="await",
-                file_path=rel,
-                line=line,
-                raw_target=m.group(0)[:80],
-            )
-        )
-
-    return out
-
-
-def _extract_awaits_in_body(
-    out: FileExtract,
-    clean: str,
-    body_lo: int,
-    body_hi: int,
-    source_qname: str,
-    rel: str,
-    rules: list[dict[str, str]],
-) -> None:
-    chunk = clean[body_lo : body_hi + 1]
-    for m in _CO_AWAIT.finditer(chunk):
-        abs_idx = body_lo + m.start()
-        target = _normalize_await_target(m.group("target"))
-        domain, backend = "unknown", ""
-        hit = match_device(target, rules) or match_device(m.group(0), rules)
-        if hit:
-            domain, backend = hit
-        out.edges.append(
-            RawEdge(
-                source_qname=source_qname,
-                target_name=target,
-                kind="await",
-                file_path=rel,
-                line=line_of(clean, abs_idx),
-                domain=domain,
-                backend=backend,
-                raw_target=m.group(0)[:120],
-            )
-        )
-
-
-def _extract_device_calls_in_body(
-    out: FileExtract,
-    clean: str,
-    body_lo: int,
-    body_hi: int,
-    source_qname: str,
-    rel: str,
-    rules: list[dict[str, str]],
-) -> None:
-    chunk = clean[body_lo : body_hi + 1]
-    # Longest match first; skip positions already covered (clEnqueue vs clEnqueueNDRange…)
-    ranked = sorted(rules, key=lambda r: len(r.get("match") or ""), reverse=True)
-    covered: list[tuple[int, int]] = []
-    await_targets = {
-        e.target_name.split("::")[-1]
-        for e in out.edges
-        if e.source_qname == source_qname and e.kind == "await"
-    }
-    for rule in ranked:
-        needle = rule["match"]
-        start = 0
-        while True:
-            idx = chunk.find(needle, start)
-            if idx < 0:
-                break
-            end = idx + len(needle)
-            if any(not (end <= a or idx >= b) for a, b in covered):
-                start = idx + 1
+        used = set()
+        for hit in out.device_hits:
+            key = (hit["match"], hit["line"])
+            if key in used:
                 continue
-            # If this API is already the target of co_await from same function, skip
-            if needle.split("::")[-1] in await_targets or any(
-                needle in t or t in needle for t in await_targets
-            ):
-                start = end
-                continue
-            covered.append((idx, end))
-            abs_idx = body_lo + idx
+            # longest only per line
+            used.add(key)
             out.edges.append(
                 RawEdge(
-                    source_qname=source_qname,
-                    target_name=needle,
+                    source_qname=file_node,
+                    target_name=hit["match"],
                     kind="device_call",
                     file_path=rel,
-                    line=line_of(clean, abs_idx),
-                    domain=rule.get("domain", "unknown"),
-                    backend=rule.get("backend", ""),
-                    raw_target=needle,
+                    line=hit["line"],
+                    domain=hit["domain"],
+                    backend=hit.get("backend", ""),
+                    raw_target=hit["match"],
                 )
             )
-            start = end
+
+    return out

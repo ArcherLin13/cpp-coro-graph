@@ -102,20 +102,36 @@ def index_repo(
     extracts: list[FileExtract] = []
     total = len(files)
     log(f"parsing {total} files ...")
+    skipped = 0
     for i, fp in enumerate(files, 1):
         rel = str(fp.relative_to(root)).replace("\\", "/")
-        if i == 1 or i % 50 == 0 or i == total:
-            log(f"  parse [{i}/{total}] {rel}")
+        try:
+            sz = fp.stat().st_size
+        except OSError:
+            sz = -1
+        log(f"  parse start [{i}/{total}] {rel} ({sz} bytes)")
+        t1 = time.time()
         try:
             ex = extract_file(fp, rel, rules)
         except Exception as exc:  # noqa: BLE001
             log(f"  SKIP {rel}: {exc}")
+            skipped += 1
             continue
+        dt = time.time() - t1
+        if ex.skipped:
+            skipped += 1
+            log(f"  parse done  [{i}/{total}] skipped={ex.skipped} ({dt:.2f}s)")
+        elif dt >= 0.5 or i == 1 or i % 25 == 0 or i == total:
+            log(
+                f"  parse done  [{i}/{total}] nodes={len(ex.nodes)} "
+                f"edges={len(ex.edges)} ({dt:.2f}s)"
+            )
         extracts.append(ex)
         conn.execute(
             "INSERT OR REPLACE INTO files(path, size, indexed_at) VALUES(?,?,?)",
-            (rel, fp.stat().st_size, int(time.time())),
+            (rel, sz if sz >= 0 else 0, int(time.time())),
         )
+    log(f"parse pass finished (skipped_or_light={skipped})")
 
     log("building nodes ...")
     by_qname: dict[str, str] = {}
