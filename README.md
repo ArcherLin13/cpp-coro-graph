@@ -59,6 +59,34 @@ Smoke test:
 ./scripts/cpp-coro-graph viz --db fixtures/sample/.cpp-coro-graph/graph.db
 ```
 
+## Query the graph (codegraph-style)
+
+Large graphs (10k+ nodes) — **prefer these over HTML**:
+
+```bash
+DB=/path/to/repo/.cpp-coro-graph/graph.db
+
+# search symbols
+python3 -u -m cpp_coro_graph -q query OnSos --db "$DB"
+
+# who calls / awaits this
+python3 -u -m cpp_coro_graph -q callers OnSos --db "$DB"
+
+# what it calls / awaits / spawns
+python3 -u -m cpp_coro_graph -q callees OnSos --db "$DB" --edge-kind calls,await,spawns
+
+# neighborhood BFS
+python3 -u -m cpp_coro_graph -q explore OnSos --depth 2 --db "$DB"
+
+# incoming blast radius
+python3 -u -m cpp_coro_graph -q impact OnSos --depth 2 --db "$DB"
+
+# JSON for scripting
+python3 -u -m cpp_coro_graph -q callers OnSos --db "$DB" --json
+```
+
+If you `cd` into the indexed repo, `--db` can be omitted (searches upward for `.cpp-coro-graph/graph.db`).
+
 ## Cursor MCP (optional)
 
 ```json
