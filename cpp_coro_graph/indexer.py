@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -37,10 +39,14 @@ SKIP_DIRS = {
 }
 
 
+def log(msg: str) -> None:
+    """Progress to stderr so JSON stats on stdout stay clean if piped."""
+    print(f"[cpp-coro-graph] {msg}", file=sys.stderr, flush=True)
+
+
 def should_skip_dir(name: str) -> bool:
     if name in SKIP_DIRS or name.startswith("."):
         return True
-    # Linux / Android / Bazel style generated trees
     if name.startswith("bazel-") or name.startswith("cmake-build"):
         return True
     return False
@@ -48,60 +54,22 @@ def should_skip_dir(name: str) -> bool:
 
 def iter_cpp_files(root: Path) -> list[Path]:
     files: list[Path] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in CPP_EXTS:
-            continue
-        # skip if any parent is blacklisted
-        skip = False
-        for parent in p.relative_to(root).parents:
-            if parent.parts and should_skip_dir(parent.parts[-1] if parent.parts else ""):
-                skip = True
-                break
-        parts = p.relative_to(root).parts
-        if any(should_skip_dir(part) for part in parts[:-1]):
-            skip = True
-        if skip:
-            continue
-        files.append(p)
+    scanned_dirs = 0
+    log(f"scanning under {root} …")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        scanned_dirs += 1
+        if scanned_dirs == 1 or scanned_dirs % 200 == 0:
+            log(
+                f"  walking… dirs={scanned_dirs} cpp_files={len(files)} "
+                f"current={dirpath}"
+            )
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.suffix.lower() in CPP_EXTS:
+                files.append(p)
+    log(f"scan done: {len(files)} C/C++ files in {scanned_dirs} dirs")
     return sorted(files)
-
-
-def resolve_target(
-    target_name: str,
-    by_qname: dict[str, str],
-    by_name: dict[str, list[str]],
-    unresolved_prefix: str,
-    file_path: str,
-    line: int,
-    kind: str,
-    domain: str,
-    backend: str,
-) -> str:
-    """Map await/call target text to a node id, creating unresolved stubs."""
-    # strip template args leftovers
-    t = target_name.split("<", 1)[0]
-    # member call: keep last segment for name lookup, full for qname
-    simple = t.split("->")[-1].split(".")[-1]
-    simple = simple.split("::")[-1]
-
-    if t in by_qname:
-        return by_qname[t]
-    if simple in by_qname:
-        return by_qname[simple]
-    # unique short name
-    ids = by_name.get(simple) or by_name.get(t) or []
-    if len(ids) == 1:
-        return ids[0]
-    if len(ids) > 1:
-        # prefer same-file later; for now first
-        return ids[0]
-
-    # stub unresolved
-    stub_q = f"unresolved:{t}"
-    stub_id = f"{unresolved_prefix}:{stub_q}"
-    return stub_id
 
 
 def index_repo(
@@ -110,12 +78,21 @@ def index_repo(
     rules_path: Path | None = None,
     max_files: int = 0,
 ) -> dict:
+    t0 = time.time()
     root = root.resolve()
+    log(f"index start root={root}")
+    log(f"db={db_path}")
     rules = load_device_rules(rules_path)
+    log(f"loaded {len(rules)} device rules")
     files = iter_cpp_files(root)
     if max_files > 0:
         files = files[:max_files]
+        log(f"--max-files={max_files}, using {len(files)} files")
 
+    if not files:
+        log("WARNING: no .cpp/.h/.cc/… files found (check path / skip rules)")
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
@@ -123,22 +100,30 @@ def index_repo(
     store.upsert_meta(conn, "version", "0.1.0")
 
     extracts: list[FileExtract] = []
-    for fp in files:
+    total = len(files)
+    log(f"parsing {total} files …")
+    for i, fp in enumerate(files, 1):
         rel = str(fp.relative_to(root)).replace("\\", "/")
-        ex = extract_file(fp, rel, rules)
+        if i == 1 or i % 50 == 0 or i == total:
+            log(f"  parse [{i}/{total}] {rel}")
+        try:
+            ex = extract_file(fp, rel, rules)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  SKIP {rel}: {exc}")
+            continue
         extracts.append(ex)
         conn.execute(
             "INSERT OR REPLACE INTO files(path, size, indexed_at) VALUES(?,?,?)",
             (rel, fp.stat().st_size, int(time.time())),
         )
 
-    # Pass 1: insert all known nodes
+    log("building nodes …")
     by_qname: dict[str, str] = {}
     by_name: dict[str, list[str]] = {}
+    node_count = 0
     for ex in extracts:
         for n in ex.nodes:
             nid = store.node_id(n.qualified_name, n.file_path, n.start_line)
-            # also allow lookup by bare qname (last writer wins for duplicates)
             by_qname[n.qualified_name] = nid
             by_qname[n.name] = nid
             by_name.setdefault(n.name, []).append(nid)
@@ -159,14 +144,16 @@ def index_repo(
                     n.signature,
                 ),
             )
+            node_count += 1
+    log(f"nodes inserted: {node_count}")
 
-    # Pass 2: edges + unresolved stubs
+    log("building edges …")
     stub_ids: set[str] = set()
+    edge_count = 0
     for ex in extracts:
         for e in ex.edges:
             src = by_qname.get(e.source_qname)
             if not src:
-                # try find node with that qname from DB keys
                 continue
             t = e.target_name.split("<", 1)[0]
             simple = t.split("->")[-1].split(".")[-1].split("::")[-1]
@@ -178,7 +165,6 @@ def index_repo(
             elif simple in by_name and len(by_name[simple]) == 1:
                 tgt = by_name[simple][0]
             elif simple in by_name and len(by_name[simple]) > 1:
-                # prefer same file
                 same = [
                     i
                     for i in by_name[simple]
@@ -231,8 +217,10 @@ def index_repo(
                     json.dumps({"raw": e.raw_target}),
                 ),
             )
+            edge_count += 1
+    log(f"edges inserted: {edge_count} (unresolved stubs: {len(stub_ids)})")
 
-    # Promote node domain if it has device_call edges
+    log("promoting device domains …")
     for row in conn.execute(
         "SELECT source, domain FROM edges WHERE kind='device_call' AND domain!='unknown'"
     ).fetchall():
@@ -247,4 +235,5 @@ def index_repo(
     s["root"] = str(root)
     s["db"] = str(db_path)
     conn.close()
+    log(f"index done in {time.time() - t0:.1f}s → {db_path}")
     return s
