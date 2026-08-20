@@ -139,6 +139,8 @@ function visibleNodes() {
   const linked = onlyLinked ? linkedIds(ekind) : null;
   return DATA.nodes.filter(n => {
     if (hideU && (n.kind === 'unresolved' || String(n.id).startsWith('unresolved:'))) return false;
+    // calls+await view: never show file nodes (those are contains-only)
+    if ((ekind === 'control' || ekind === 'calls' || ekind === 'await') && (n.kind === 'file' || String(n.qname||'').startsWith('file:'))) return false;
     if (linked && !linked.has(n.id)) return false;
     if (domain && n.domain !== domain) return false;
     if (q && !(`${n.label} ${n.qname||''} ${n.file}`.toLowerCase().includes(q))) return false;

@@ -935,7 +935,7 @@ def extract_file(
     for qn, lo, hi, _ns in bodies:
         locals_by_owner[qn] = _locals_in_body(clean[lo : hi + 1])
 
-    # Collect awaits — only `await` edges (not also `calls`).
+    # Collect awaits — only from a real function/coroutine body (never file:).
     await_pairs: set[tuple[str, str]] = set()  # (owner, target) to suppress dup calls
     awaits: list[tuple[int, str, str, str, str]] = []
     for rx in (_CO_AWAIT, _CO_AWAIT_MACRO):
@@ -943,20 +943,9 @@ def extract_file(
             idx = m.start()
             owner = _owner_at(body_triples, idx)
             if owner is None:
-                file_node = f'file:{rel}'
-                if file_node not in seen_qnames:
-                    seen_qnames.add(file_node)
-                    out.nodes.append(
-                        RawNode(
-                            name=Path(rel).name,
-                            qualified_name=file_node,
-                            kind='file',
-                            file_path=rel,
-                            start_line=1,
-                            end_line=1,
-                        )
-                    )
-                owner = file_node
+                # Orphan co_await (failed body match / global scope) — do not
+                # invent file:*.cpp as the caller; await must hang off a function.
+                continue
             target = _qualify_member_target(
                 m.group('target'),
                 owner_qname=owner,
@@ -968,7 +957,6 @@ def extract_file(
                 domain, backend = hit
             awaits.append((idx, target, owner, domain, backend))
             await_pairs.add((owner, target))
-            # also suppress bare method name dup
             await_pairs.add((owner, target.split('::')[-1]))
             out.edges.append(
                 RawEdge(
@@ -1100,22 +1088,8 @@ def extract_file(
                 covered_ranges.append((idx, end))
                 owner = _owner_at(body_triples, idx)
                 if owner is None:
-                    file_node = f'file:{rel}'
-                    if file_node not in seen_qnames:
-                        seen_qnames.add(file_node)
-                        out.nodes.append(
-                            RawNode(
-                                name=Path(rel).name,
-                                qualified_name=file_node,
-                                kind='file',
-                                file_path=rel,
-                                start_line=1,
-                                end_line=1,
-                                domain=rule.get('domain', 'unknown'),
-                                backend=rule.get('backend', ''),
-                            )
-                        )
-                    owner = file_node
+                    start = end
+                    continue
                 out.edges.append(
                     RawEdge(
                         source_qname=owner,

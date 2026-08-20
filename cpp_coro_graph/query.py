@@ -101,6 +101,10 @@ def neighbors(
     if hide_unresolved:
         col = "s" if direction == "callers" else "t"
         sql += f" AND {col}.kind != 'unresolved'"
+    # Control-flow queries should never surface file: nodes
+    if edge_kinds is not None and set(edge_kinds) <= {"calls", "await"}:
+        col = "s" if direction == "callers" else "t"
+        sql += f" AND {col}.kind != 'file' AND {col}.qualified_name NOT LIKE 'file:%'"
     sql += " ORDER BY e.kind, qualified_name LIMIT ?"
     args.append(limit)
     return [row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
