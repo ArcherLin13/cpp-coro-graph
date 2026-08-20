@@ -1,0 +1,2 @@
+# V1 uses Python stdlib only (sqlite3, json, re, pathlib, http.server).
+# Optional later: tree-sitter, tree-sitter-cpp
