@@ -88,11 +88,69 @@ def _print_edges(rows: list[dict], *, direction: str, as_json: bool) -> None:
         return
     for r in rows:
         loc = f"{r.get('edge_file', r.get('file_path', ''))}:{r.get('edge_line', r.get('line', ''))}"
+        sig = r.get("signature", "") or ""
+        sig_str = (
+            f"  {sig[:80]}"
+            if sig and sig != r.get("qualified_name", "")
+            else ""
+        )
         print(
             f"  [{r.get('edge_kind')}]  {r.get('qualified_name')}  "
-            f"({r.get('kind')})  {loc}",
+            f"({r.get('kind')})  {loc}{sig_str}",
             flush=True,
         )
+
+
+def _count_hidden(
+    conn, node_id: str, direction: str, edge_kinds: list[str]
+) -> int:
+    """Count unresolved neighbors hidden by hide_unresolved."""
+    if direction == "callers":
+        sql = (
+            "SELECT COUNT(*) AS c FROM edges e JOIN nodes s ON s.id=e.source "
+            "WHERE e.target=? AND s.kind='unresolved'"
+        )
+    else:
+        sql = (
+            "SELECT COUNT(*) AS c FROM edges e JOIN nodes t ON t.id=e.target "
+            "WHERE e.source=? AND t.kind='unresolved'"
+        )
+    args: list = [node_id]
+    if edge_kinds:
+        placeholders = ",".join("?" * len(edge_kinds))
+        sql += f" AND e.kind IN ({placeholders})"
+        args.extend(edge_kinds)
+    row = conn.execute(sql, args).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def _print_hidden_hint(hidden: int, flag: str = "--show-unresolved") -> None:
+    if hidden > 0:
+        print(
+            f"# ({hidden} unresolved neighbors hidden — use {flag} to show)",
+            flush=True,
+        )
+
+
+def _print_no_match_hint(conn, keyword: str) -> None:
+    """Show 'did you mean?' suggestions when no symbol matches."""
+    from difflib import get_close_matches
+
+    rows = conn.execute(
+        "SELECT DISTINCT qualified_name, name FROM nodes "
+        "WHERE kind IN ('coroutine','function','declaration') "
+        "ORDER BY length(qualified_name) LIMIT 2000"
+    ).fetchall()
+    simple_to_qname: dict[str, str] = {}
+    for r in rows:
+        simple_to_qname.setdefault(r["name"], r["qualified_name"])
+    close_simple = get_close_matches(
+        keyword, list(simple_to_qname.keys()), n=5, cutoff=0.4
+    )
+    if close_simple:
+        print(f"# no exact match for '{keyword}'. Did you mean:", flush=True)
+        for s in close_simple:
+            print(f"#   {simple_to_qname[s]}", flush=True)
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -216,6 +274,7 @@ def cmd_callers(args: argparse.Namespace) -> int:
     primary = Q.pick_primary(matches, args.keyword)
     if not primary:
         print("(no symbol match)", flush=True)
+        _print_no_match_hint(conn, args.keyword)
         conn.close()
         return 1
     if not args.json:
@@ -226,16 +285,20 @@ def cmd_callers(args: argparse.Namespace) -> int:
         )
         if len(matches) > 1:
             print(f"# note: {len(matches)} matches; using best hit", flush=True)
+    edge_kinds = _parse_kinds(args.edge_kind)
     rows = Q.dedupe_neighbors(
         Q.neighbors(
             conn,
             primary["id"],
             direction="callers",
-            edge_kinds=_parse_kinds(args.edge_kind),
+            edge_kinds=edge_kinds,
             limit=args.limit,
             hide_unresolved=not args.show_unresolved,
         )
     )
+    if not args.show_unresolved and not args.json and not rows:
+        hidden = _count_hidden(conn, primary["id"], "callers", edge_kinds)
+        _print_hidden_hint(hidden)
     conn.close()
     if args.json:
         print(
@@ -261,6 +324,7 @@ def cmd_callees(args: argparse.Namespace) -> int:
     primary = Q.pick_primary(matches, args.keyword)
     if not primary:
         print("(no symbol match)", flush=True)
+        _print_no_match_hint(conn, args.keyword)
         conn.close()
         return 1
     if not args.json:
@@ -269,16 +333,20 @@ def cmd_callees(args: argparse.Namespace) -> int:
             f"({primary['file_path']}:{primary['start_line']})",
             flush=True,
         )
+    edge_kinds = _parse_kinds(args.edge_kind)
     rows = Q.dedupe_neighbors(
         Q.neighbors(
             conn,
             primary["id"],
             direction="callees",
-            edge_kinds=_parse_kinds(args.edge_kind),
+            edge_kinds=edge_kinds,
             limit=args.limit,
             hide_unresolved=not args.show_unresolved,
         )
     )
+    if not args.show_unresolved and not args.json:
+        hidden = _count_hidden(conn, primary["id"], "callees", edge_kinds)
+        _print_hidden_hint(hidden)
     conn.close()
     if args.json:
         print(

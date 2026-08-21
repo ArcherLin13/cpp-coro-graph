@@ -1008,7 +1008,7 @@ def extract_file(
                 domain, backend = hit
         node_kind = (
             'coroutine'
-            if is_coro
+            if is_coro and kind == 'function'
             else ('function' if kind == 'function' else 'declaration')
         )
         out.nodes.append(

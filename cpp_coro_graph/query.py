@@ -82,7 +82,7 @@ def neighbors(
         sql = (
             "SELECT e.kind AS edge_kind, e.line AS edge_line, e.file_path AS edge_file, "
             "s.id, s.name, s.qualified_name, s.kind, s.file_path, s.start_line, "
-            "s.domain, s.namespace "
+            "s.domain, s.namespace, s.signature "
             "FROM edges e JOIN nodes s ON s.id = e.source "
             "WHERE e.target = ?"
         )
@@ -90,7 +90,7 @@ def neighbors(
         sql = (
             "SELECT e.kind AS edge_kind, e.line AS edge_line, e.file_path AS edge_file, "
             "t.id, t.name, t.qualified_name, t.kind, t.file_path, t.start_line, "
-            "t.domain, t.namespace "
+            "t.domain, t.namespace, t.signature "
             "FROM edges e JOIN nodes t ON t.id = e.target "
             "WHERE e.source = ?"
         )
