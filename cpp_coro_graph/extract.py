@@ -37,6 +37,12 @@ _LOCAL_OBJ = re.compile(
     r"(?P<var>[A-Za-z_]\w*)\s*(?:[=;({]|\{)",
     re.M,
 )
+# auto var = Type(...);  /  auto& var = Type{...};  /  auto* var = ns::Type(...)
+_AUTO_TYPE = re.compile(
+    r"\bauto\s*(?:\*|&)?\s*(?P<var>[A-Za-z_]\w*)\s*=\s*"
+    r"(?P<type>[A-Za-z_][\w:]*)\s*[\({]",
+    re.M,
+)
 _CORO_KW = re.compile(r"\b(?:co_await|co_return|co_yield|CO_AWAIT|COAWAIT|CoAwait)\b")
 
 # Call-like: Name( / Qual::Name( / obj.Name( / ptr->Name(
@@ -336,7 +342,15 @@ def _read_func_name_before_paren(text: str, paren_close: int) -> tuple[str, int]
     return qname, name_start
 
 
-_TRAILING_KW = ("override", "final", "const", "volatile", "mutable", "noexcept")
+_TRAILING_KW = (
+    "override",
+    "final",
+    "const",
+    "volatile",
+    "mutable",
+    "noexcept",
+    "try",  # function-try-block: Foo() try {
+)
 
 
 def _looks_like_control_or_type(text: str, name_start: int, qname: str) -> bool:
@@ -384,7 +398,7 @@ def _find_param_close_back(text: str, j: int) -> int | None:
     """From position just before `{` / `;` / `=`, find `)` that closes the param list."""
     j = _skip_ws_back(text, j)
     j = _skip_attr_back(text, j)
-    for _ in range(50):
+    for _ in range(80):
         if j < 0:
             return None
         matched = False
@@ -397,6 +411,13 @@ def _find_param_close_back(text: str, j: int) -> int | None:
                     matched = True
                     break
         if matched:
+            continue
+        # ref-qualifiers: & / &&
+        if j >= 1 and text[j - 1 : j + 1] == "&&":
+            j = _skip_ws_back(text, j - 2)
+            continue
+        if j >= 0 and text[j] == "&":
+            j = _skip_ws_back(text, j - 1)
             continue
         if j >= 0 and text[j] == ")":
             d = 0
@@ -422,9 +443,17 @@ def _find_param_close_back(text: str, j: int) -> int | None:
             while j >= 0 and text[j] != ")":
                 j -= 1
             continue
-        if j >= 0 and text[j] in "&*":
+        if j >= 0 and text[j] in "*":
             j = _skip_ws_back(text, j - 1)
             continue
+        # requires-clause / leftover tokens between ) and {: jump to ')' before requires
+        window_lo = max(0, j - 240)
+        req = text.rfind("requires", window_lo, j + 1)
+        if req >= 0:
+            # ensure it's a keyword boundary
+            if req == 0 or not (text[req - 1].isalnum() or text[req - 1] == "_"):
+                j = _skip_ws_back(text, req - 1)
+                continue
         return None
     return None
 
@@ -631,41 +660,18 @@ def iter_functions(
                 continue
 
         if text[i] == "{":
-            # probe: function definition?
-            j = _skip_ws_back(text, i - 1)
-            probe = j
-            ok = False
-            for _ in range(24):
-                if probe < 0:
-                    break
-                if text[probe] == ")":
-                    ok = True
-                    break
-                advanced = False
-                for kw in _TRAILING_KW:
-                    L = len(kw)
-                    if probe >= L - 1 and text[probe - L + 1 : probe + 1] == kw:
-                        b = probe - L
-                        if b < 0 or not (text[b].isalnum() or text[b] == "_"):
-                            probe = _skip_ws_back(text, probe - L)
-                            advanced = True
-                            break
-                if advanced:
-                    continue
-                if probe >= 1 and text[probe - 1 : probe + 1] == "]]":
-                    probe = _skip_attr_back(text, probe)
-                    continue
-                break
-            if ok and i not in ns_push and i not in class_push:
-                parsed = parse_function_at_brace(text, i, class_stack)
-                if parsed:
-                    local_qname, name_start, lo, hi = parsed
-                    local_qname = _qualify_with_class(local_qname, class_stack)
-                    ns = "::".join(x for x in ns_stack if x)
-                    out.append((local_qname, name_start, lo, hi, ns, "function"))
-                    def_ranges.append((lo, hi))
-                    i = hi + 1
-                    continue
+            # function body? reuse param-close walker (handles const/&/try/requires/attrs)
+            if i not in ns_push and i not in class_push:
+                if _find_param_close_back(text, i - 1) is not None:
+                    parsed = parse_function_at_brace(text, i, class_stack)
+                    if parsed:
+                        local_qname, name_start, lo, hi = parsed
+                        local_qname = _qualify_with_class(local_qname, class_stack)
+                        ns = "::".join(x for x in ns_stack if x)
+                        out.append((local_qname, name_start, lo, hi, ns, "function"))
+                        def_ranges.append((lo, hi))
+                        i = hi + 1
+                        continue
             i += 1
             continue
 
@@ -710,6 +716,53 @@ def _qualify(local_qname: str, namespace: str) -> str:
     return f"{namespace}::{local_qname}"
 
 
+def _extract_signature(clean: str, name_start: int, body_lo: int, kind: str) -> str:
+    """Extract a readable function signature: 'ret_type Name(params)'."""
+    paren_open = clean.find("(", name_start)
+    if paren_open < 0:
+        return ""
+    depth = 0
+    k = paren_open
+    n = len(clean)
+    while k < n:
+        if clean[k] == "(":
+            depth += 1
+        elif clean[k] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    if k >= n:
+        return ""
+    paren_close = k
+
+    j = name_start - 1
+    while j >= 0:
+        c = clean[j]
+        if c in ";{}":
+            break
+        if c == ">":
+            d = 1
+            j -= 1
+            while j >= 0 and d > 0:
+                if clean[j] == ">":
+                    d += 1
+                elif clean[j] == "<":
+                    d -= 1
+                j -= 1
+            continue
+        j -= 1
+    sig_start = j + 1 if j >= 0 else 0
+
+    sig = clean[sig_start : paren_close + 1].strip()
+    sig = re.sub(r"\s+", " ", sig)
+    # Strip leading macro calls (e.g., CATCH_AND_NEST()) that leaked from
+    # function-try-block catch handlers between consecutive functions.
+    sig = re.sub(r"^(?:[A-Z_][A-Z_0-9]*\s*\(\s*\)\s*)+", "", sig)
+    sig = re.sub(r"\s+(?:try|override|final|const|volatile|noexcept)\s*$", "", sig)
+    return sig
+
+
 def _normalize_target(raw: str) -> str:
     return re.sub(r"\s+", "", raw)
 
@@ -724,6 +777,44 @@ def _owner_at(bodies: list[tuple[str, int, int]], idx: int) -> str | None:
                 best = span
                 owner = qn
     return owner
+
+
+def _owner_at_fallback(
+    text: str, idx: int, bodies: list[tuple[str, int, int]], ns_of: dict[str, str]
+) -> str | None:
+    """If body list missed the function, recover from innermost `{` that wraps idx."""
+    # Collect '{' positions before idx whose matching '}' is after idx
+    opens: list[int] = []
+    i = 0
+    while i < idx:
+        if text[i] == "{":
+            hi = find_matching_brace(text, i)
+            if hi >= idx:
+                opens.append(i)
+            i += 1
+            continue
+        i += 1
+    for brace in reversed(opens):  # innermost first
+        # skip obvious namespace/class braces: name before { is namespace/class/struct
+        pre = _skip_ws_back(text, brace - 1)
+        # try parse as function
+        parsed = parse_function_at_brace(text, brace, [])
+        if not parsed:
+            continue
+        local_qname, name_start, lo, hi = parsed
+        # Prefer already-known body qname if same span
+        for qn, blo, bhi in bodies:
+            if blo == lo and bhi == hi:
+                return qn
+        # Qualify with best-effort namespace from nearby known bodies
+        ns = ""
+        for qn, blo, bhi in bodies:
+            if blo < lo < bhi or blo < hi < bhi:
+                ns = ns_of.get(qn, "")
+                break
+        qname = _qualify(local_qname, ns) if ns else local_qname
+        return qname
+    return None
 
 
 def _enclosing_class(qname: str) -> str | None:
@@ -768,8 +859,16 @@ def _locals_in_body(chunk: str) -> dict[str, str]:
         "volatile",
         "register",
         "extern",
-        "auto",  # auto x = T{} — type unknown; skip
+        "auto",  # auto x = T{} — handled separately via _AUTO_TYPE
     }
+    # First pass: auto var = Type(...) / Type{...} — extract type from RHS
+    for m in _AUTO_TYPE.finditer(chunk):
+        var = m.group("var")
+        typ = m.group("type")
+        if typ in skip_types or var in skip_types:
+            continue
+        out.setdefault(var, typ)
+    # Second pass: explicit Type var; / Type var{...}; / Type* var = ...
     for m in _LOCAL_OBJ.finditer(chunk):
         typ = m.group("type")
         var = m.group("var")
@@ -797,6 +896,11 @@ def _qualify_member_target(
     elif "." in t:
         recv, method = t.rsplit(".", 1)
     method = method.split("::")[-1]
+
+    # No receiver: keep already-qualified free-function targets (ns::Foo).
+    # Only try enclosing-class qualification for bare names.
+    if not recv and "::" in t:
+        return t
 
     type_name = ""
     if recv:
@@ -917,7 +1021,7 @@ def extract_file(
                 end_line=line_of(clean, body_hi if body_hi >= 0 else name_start),
                 domain=domain,
                 backend=backend,
-                signature=uniq,
+                signature=_extract_signature(clean, name_start, body_lo, kind) or uniq,
                 body_lo=body_lo,
                 body_hi=body_hi,
                 namespace=ns,
@@ -943,9 +1047,27 @@ def extract_file(
             idx = m.start()
             owner = _owner_at(body_triples, idx)
             if owner is None:
-                # Orphan co_await (failed body match / global scope) — do not
-                # invent file:*.cpp as the caller; await must hang off a function.
+                owner = _owner_at_fallback(clean, idx, body_triples, ns_of)
+            if owner is None:
+                # Still unknown — drop (do not invent file:*.cpp callers)
                 continue
+            # If fallback invented a qname not in nodes, still emit edge; indexer resolves target
+            if owner not in ns_of and owner not in seen_qnames:
+                # ensure a node exists for the recovered owner
+                leaf = owner.split("::")[-1]
+                seen_qnames.add(owner)
+                out.nodes.append(
+                    RawNode(
+                        name=leaf,
+                        qualified_name=owner,
+                        kind="coroutine",
+                        file_path=rel,
+                        start_line=line_of(clean, idx),
+                        end_line=line_of(clean, idx),
+                        signature=owner,
+                    )
+                )
+                ns_of[owner] = ""
             target = _qualify_member_target(
                 m.group('target'),
                 owner_qname=owner,

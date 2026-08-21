@@ -29,6 +29,15 @@ class SymbolIndex:
     by_qname_rank: dict[str, int] = field(default_factory=dict)
     by_name: dict[str, list[SymbolRef]] = field(default_factory=dict)
     by_file_qname: dict[tuple[str, str], str] = field(default_factory=dict)
+    # base qname (without @line suffix) -> list of (node_id, rank)
+    _overloads: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+
+    def _base_qname(self, qname: str) -> str:
+        """Strip @line suffix to get the base qualified name."""
+        at = qname.rfind("@")
+        if at > 0 and qname[at + 1 :].isdigit():
+            return qname[:at]
+        return qname
 
     def _put_qname(self, key: str, ref: SymbolRef) -> None:
         r = _rank(ref.kind)
@@ -44,6 +53,12 @@ class SymbolIndex:
         self.by_file_qname[(ref.file_path, ref.qualified_name)] = ref.node_id
         if ref.namespace:
             self._put_qname(f"{ref.namespace}::{ref.name}", ref)
+        # Track overloads: base qname -> all variants
+        base = self._base_qname(ref.qualified_name)
+        if ref.qualified_name != base:
+            self._overloads.setdefault(base, []).append(
+                (ref.node_id, _rank(ref.kind))
+            )
 
     def resolve(
         self,
@@ -139,4 +154,51 @@ class SymbolIndex:
         defs = [r for r in refs if _rank(r.kind) >= 2]
         if len(defs) == 1:
             return defs[0].node_id
+        return None
+
+    def resolve_overload(
+        self,
+        target: str,
+        *,
+        avoid_id: str,
+        from_file: str,
+        from_namespace: str = "",
+        usings: list[str] | None = None,
+    ) -> str | None:
+        """Resolve target to a different node than avoid_id (self-ref avoidance).
+
+        Used when a static entry co_awaits a same-named member overload (@line).
+        """
+        primary = self.resolve(
+            target,
+            from_file=from_file,
+            from_namespace=from_namespace,
+            usings=usings,
+        )
+        if primary is None:
+            return None
+
+        for qname, nid in self.by_qname.items():
+            if nid != primary:
+                continue
+            base = self._base_qname(qname)
+            if base != qname:
+                overloads = self._overloads.get(base, [])
+            else:
+                overloads = self._overloads.get(qname, [])
+            if not overloads:
+                overloads = self._overloads.get(base, [])
+
+            best = None
+            best_rank = -1
+            for oid, rank in overloads:
+                if oid == avoid_id:
+                    continue
+                if rank > best_rank:
+                    best = oid
+                    best_rank = rank
+            if best:
+                return best
+            break
+
         return None

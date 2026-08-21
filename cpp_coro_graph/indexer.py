@@ -108,8 +108,8 @@ def index_repo(
     conn = store.connect(db_path)
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
-    store.upsert_meta(conn, "mode", "syntax-v1.7-four-edges")
-    store.upsert_meta(conn, "version", "0.4.0")
+    store.upsert_meta(conn, "mode", "syntax-v1.8-auto-sig-overload")
+    store.upsert_meta(conn, "version", "0.4.1")
 
     extracts: list[FileExtract] = []
     total = len(files)
@@ -217,6 +217,17 @@ def index_repo(
                     from_namespace=e.source_namespace,
                     usings=ex.usings,
                 )
+            # Avoid self-references: static entry awaiting same-named overload
+            if tgt == src:
+                alt = index.resolve_overload(
+                    e.target_name,
+                    avoid_id=src,
+                    from_file=e.file_path,
+                    from_namespace=e.source_namespace,
+                    usings=ex.usings,
+                )
+                if alt:
+                    tgt = alt
             if tgt is not None:
                 # count as cross-file if target file differs
                 row = conn.execute(
