@@ -123,8 +123,20 @@ def cmd_viz(args: argparse.Namespace) -> int:
         return 2
     log(f"command=viz db={db}")
     out = Path(args.out).resolve() if args.out else db.with_suffix(".html")
-    path = write_html(db, out)
+    path = write_html(
+        db,
+        out,
+        module=getattr(args, "module", "") or "",
+        around=getattr(args, "around", "") or "",
+        depth=getattr(args, "depth", 1) or 1,
+        full=bool(getattr(args, "full", False)),
+    )
     print(f"wrote {path}", flush=True)
+    if not args.full:
+        print(
+            "open in browser: pick module / double-click node to expand await trunk",
+            flush=True,
+        )
     return 0
 
 
@@ -411,9 +423,35 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--max-files", type=int, default=0, help="Cap files (debug)")
     i.set_defaults(func=cmd_index)
 
-    v = sub.add_parser("viz", help="Write interactive HTML graph (full DB)")
+    v = sub.add_parser(
+        "viz",
+        help="Write interactive HTML: module entries + await trunk (not full graph)",
+    )
     _add_db_arg(v)
     v.add_argument("--out", type=str, default="")
+    v.add_argument(
+        "--module",
+        type=str,
+        default="",
+        help="Module directory prefix (e.g. camera/sos or . for repo-root files)",
+    )
+    v.add_argument(
+        "--around",
+        type=str,
+        default="",
+        help="Pin a single entry symbol (keyword)",
+    )
+    v.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        help="Initial await trunk depth from entries (default 1)",
+    )
+    v.add_argument(
+        "--full",
+        action="store_true",
+        help="Embed entire DB graph (slow/unreadable on large repos)",
+    )
     v.set_defaults(func=cmd_viz)
 
     e = sub.add_parser("export", help="Export graph JSON")

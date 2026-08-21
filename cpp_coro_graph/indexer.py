@@ -109,7 +109,7 @@ def index_repo(
     store.clear_graph(conn)
     store.upsert_meta(conn, "root", str(root))
     store.upsert_meta(conn, "mode", "syntax-v1.8-auto-sig-overload")
-    store.upsert_meta(conn, "version", "0.4.1")
+    store.upsert_meta(conn, "version", "0.5.0")
 
     extracts: list[FileExtract] = []
     total = len(files)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Any
 
@@ -245,3 +246,232 @@ def impact(
                 affected.append(item)
         frontier = nxt
     return {"query": keyword, "match": primary, "affected": affected}
+
+
+# --- Module / trunk helpers for ego viz ---------------------------------
+
+_ENTRY_NAME_RE = re.compile(
+    r"^(?:Call|Entry|Main|Process|Start|Execute|On[A-Z]\w*|Run[A-Z]\w*)$"
+)
+
+
+def list_modules(conn: sqlite3.Connection, *, max_depth: int = 3) -> list[str]:
+    """Directory prefixes from node file_path (forward-slash)."""
+    dirs: set[str] = set()
+    has_root_files = False
+    for (fp,) in conn.execute(
+        "SELECT DISTINCT file_path FROM nodes "
+        "WHERE kind IN ('function','coroutine','declaration') AND file_path != ''"
+    ):
+        p = str(fp).replace("\\", "/")
+        if p.startswith("file:"):
+            continue
+        parts = [x for x in p.split("/") if x]
+        if len(parts) <= 1:
+            has_root_files = True
+            continue
+        for i in range(1, min(len(parts), max_depth + 1)):
+            dirs.add("/".join(parts[:i]))
+        dirs.add("/".join(parts[:-1]))
+    if has_root_files:
+        dirs.add(".")
+    return sorted(dirs)
+
+
+def _in_module(file_path: str, module: str) -> bool:
+    fp = (file_path or "").replace("\\", "/")
+    mod = (module or "").replace("\\", "/").rstrip("/")
+    if not mod:
+        return True
+    if mod == ".":
+        return "/" not in fp and not fp.startswith("file:")
+    return fp == mod or fp.startswith(mod + "/")
+
+
+def control_adjacency(
+    conn: sqlite3.Connection,
+    *,
+    edge_kinds: list[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """node_id -> outgoing control edges [{to, kind, line}]."""
+    kinds = edge_kinds or list(CONTROL_EDGES)
+    placeholders = ",".join("?" * len(kinds))
+    adj: dict[str, list[dict[str, Any]]] = {}
+    sql = (
+        "SELECT e.source, e.target, e.kind, e.line "
+        "FROM edges e "
+        "JOIN nodes t ON t.id = e.target "
+        f"WHERE e.kind IN ({placeholders}) "
+        "AND t.kind NOT IN ('file','unresolved') "
+        "AND t.qualified_name NOT LIKE 'file:%'"
+    )
+    for r in conn.execute(sql, kinds):
+        adj.setdefault(r["source"], []).append(
+            {"to": r["target"], "kind": r["kind"], "line": r["line"]}
+        )
+    return adj
+
+
+def module_nodes(
+    conn: sqlite3.Connection,
+    module: str,
+    *,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT id, name, qualified_name, kind, file_path, start_line, end_line, "
+        "domain, backend, namespace, signature FROM nodes "
+        "WHERE kind IN ('function','coroutine','declaration') "
+        "ORDER BY qualified_name LIMIT ?",
+        (limit * 4,),
+    ).fetchall()
+    out = [row_to_dict(r) for r in rows if _in_module(r["file_path"], module)]
+    return out[:limit]
+
+
+def module_entries(
+    conn: sqlite3.Connection,
+    module: str,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Rank likely entry points inside a module directory."""
+    nodes = module_nodes(conn, module)
+    if not nodes:
+        return []
+
+    ids = {n["id"] for n in nodes}
+    out_count: dict[str, int] = {n["id"]: 0 for n in nodes}
+    out_await: dict[str, int] = {n["id"]: 0 for n in nodes}
+    external_in: dict[str, int] = {n["id"]: 0 for n in nodes}
+    internal_in: dict[str, int] = {n["id"]: 0 for n in nodes}
+    all_files = {
+        r["id"]: r["file_path"]
+        for r in conn.execute("SELECT id, file_path FROM nodes")
+    }
+    for r in conn.execute(
+        "SELECT source, target, kind FROM edges WHERE kind IN ('calls','await')"
+    ):
+        if r["source"] in out_count:
+            out_count[r["source"]] += 1
+            if r["kind"] == "await":
+                out_await[r["source"]] += 1
+        if r["target"] not in ids:
+            continue
+        src_fp = all_files.get(r["source"], "")
+        if _in_module(src_fp, module):
+            internal_in[r["target"]] += 1
+        else:
+            external_in[r["target"]] += 1
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for n in nodes:
+        if n["kind"] == "declaration" and out_count.get(n["id"], 0) == 0:
+            continue
+        name = n["name"] or ""
+        qn = n["qualified_name"] or ""
+        score = 0
+        if _ENTRY_NAME_RE.search(name):
+            score += 50
+        if name in {"Call", "Start", "Entry", "Main"}:
+            score += 30
+        if "::Call" in qn or qn.endswith("::Call"):
+            score += 40
+        if "static" in (n.get("signature") or "").lower():
+            score += 15
+        score += min(out_await.get(n["id"], 0) * 8, 40)
+        score += min(out_count.get(n["id"], 0) * 2, 20)
+        # few internal callers + has outgoing = likely entry
+        if internal_in.get(n["id"], 0) == 0 and out_count.get(n["id"], 0) > 0:
+            score += 35
+        if external_in.get(n["id"], 0) > 0:
+            score += 25
+        if score <= 0:
+            continue
+        item = dict(n)
+        item["entry_score"] = score
+        scored.append((score, item))
+
+    scored.sort(key=lambda x: (-x[0], x[1]["qualified_name"]))
+    return [x[1] for x in scored[:limit]]
+
+
+def trunk_from_seeds(
+    conn: sqlite3.Connection,
+    seed_ids: list[str],
+    *,
+    depth: int = 1,
+    edge_kinds: list[str] | None = None,
+    limit: int = 80,
+) -> dict[str, Any]:
+    """Outgoing-only BFS trunk from seed entry points."""
+    edge_kinds = edge_kinds or ["await"]
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    seen_e: set[tuple[str, str, str]] = set()
+    visited: set[str] = set()
+    frontier: set[str] = set()
+
+    def load_node(nid: str) -> dict[str, Any] | None:
+        r = conn.execute(
+            "SELECT id, name, qualified_name, kind, file_path, start_line, "
+            "domain, namespace, signature FROM nodes WHERE id=?",
+            (nid,),
+        ).fetchone()
+        return row_to_dict(r) if r else None
+
+    for sid in seed_ids:
+        n = load_node(sid)
+        if not n or n["kind"] in {"file", "unresolved"}:
+            continue
+        nodes[sid] = n
+        frontier.add(sid)
+        visited.add(sid)
+
+    for _ in range(max(1, depth)):
+        nxt: set[str] = set()
+        for nid in frontier:
+            for nb in neighbors(
+                conn,
+                nid,
+                direction="callees",
+                edge_kinds=edge_kinds,
+                limit=limit,
+                hide_unresolved=True,
+            ):
+                oid = nb["id"]
+                if nb.get("kind") in {"file", "unresolved"}:
+                    continue
+                nodes[oid] = {
+                    "id": nb["id"],
+                    "name": nb["name"],
+                    "qualified_name": nb["qualified_name"],
+                    "kind": nb["kind"],
+                    "file_path": nb["file_path"],
+                    "start_line": nb["start_line"],
+                    "domain": nb["domain"],
+                    "namespace": nb.get("namespace", ""),
+                }
+                key = (nid, oid, nb["edge_kind"])
+                if key not in seen_e:
+                    seen_e.add(key)
+                    edges.append(
+                        {
+                            "source": nid,
+                            "target": oid,
+                            "kind": nb["edge_kind"],
+                            "file_path": nb["edge_file"],
+                            "line": nb["edge_line"],
+                        }
+                    )
+                if oid not in visited:
+                    visited.add(oid)
+                    nxt.add(oid)
+        frontier = nxt
+
+    return {
+        "seeds": [s for s in seed_ids if s in nodes],
+        "depth": depth,
+        "nodes": list(nodes.values()),
+        "edges": edges,
+    }

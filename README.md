@@ -62,6 +62,23 @@ Smoke test:
 ./scripts/cpp-coro-graph viz --db fixtures/sample/.cpp-coro-graph/graph.db
 ```
 
+## Viz (module trunk, not full universe)
+
+Default HTML is **module → entries → await trunk → double-click expand**:
+
+```bash
+# recommended: one module’s entries + main await flow
+python3 -u -m cpp_coro_graph -q viz --db "$DB" --module path/to/module --depth 1
+
+# pin one entry
+python3 -u -m cpp_coro_graph -q viz --db "$DB" --around Call --depth 1
+
+# legacy full graph (avoid on large trees)
+python3 -u -m cpp_coro_graph -q viz --db "$DB" --full
+```
+
+In the browser: pick a module, click an entry chip, **double-click** a node to expand the next await layer. Toggle `calls` if needed. File/`contains` edges are not shown in this mode.
+
 ## Query the graph (codegraph-style)
 
 Large graphs (10k+ nodes) — **prefer these over HTML**:

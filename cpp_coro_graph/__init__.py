@@ -1,3 +1,3 @@
 """C++17 coroutine + device-domain syntax graph (V1, no compile_commands)."""
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
